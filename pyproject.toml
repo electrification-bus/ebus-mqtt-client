@@ -34,3 +34,11 @@ dev = ["pytest"]
 [project.urls]
 Homepage = "https://github.com/electrification-bus/ebus-mqtt-client"
 Repository = "https://github.com/electrification-bus/ebus-mqtt-client"
+
+[tool.hatch.build]
+exclude = [
+    "CLAUDE.md",
+    "AGENTS.md",
+    ".claude/",
+    ".beads/",
+]
