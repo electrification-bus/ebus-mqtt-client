@@ -58,4 +58,4 @@ client.start()
 
 ## License
 
-MIT
+[MIT License](LICENSE) — Copyright (c) 2026 Clark Communications Corporation

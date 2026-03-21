@@ -4,18 +4,19 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ebus-mqtt-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "Standalone MQTT client wrapper around paho-mqtt v2 with TLS, reconnection, subscription recovery, and topic pattern matching"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-    {name = "eBus Contributors"}
+    {name = "Clark Communications Corporation"}
 ]
 keywords = ["mqtt", "paho", "iot", "tls"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -32,8 +33,9 @@ dependencies = [
 dev = ["pytest"]
 
 [project.urls]
-Homepage = "https://github.com/electrification-bus/ebus-mqtt-client"
+Homepage = "https://ebus.energy"
 Repository = "https://github.com/electrification-bus/ebus-mqtt-client"
+Issues = "https://github.com/electrification-bus/ebus-mqtt-client/issues"
 
 [tool.hatch.build]
 exclude = [
