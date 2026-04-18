@@ -13,7 +13,7 @@ AUTH_TYPE_USER_PASS = "USER_PASS"
 
 
 class MqttClient:
-    """MQTT client wrapper around paho-mqtt v2.
+    """MQTT client wrapper around paho-mqtt.
 
     Provides TLS support (secure, insecure, and none), automatic reconnection
     with backoff, subscription recovery on reconnect, topic pattern matching
