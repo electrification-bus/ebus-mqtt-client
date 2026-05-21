@@ -269,3 +269,27 @@ class TestIsConnected:
         mock_paho["instance"].is_connected.return_value = False
         client = MqttClient(client_id="test", endpoint="localhost", port=1883)
         assert client.is_connected() is False
+
+
+class TestOnMessage:
+    def test_dispatches_to_subscriber(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("ebus/5/+/$state", handler, qos=2)
+
+        msg = MagicMock()
+        msg.topic = "ebus/5/my-device/$state"
+        msg.payload = b"ready"
+
+        # userdata is None (no global callback) — handler is invoked directly
+        client._on_message(mock_paho["instance"], None, msg)
+        handler.assert_called_once_with("ebus/5/my-device/$state", b"ready")
+
+    def test_no_matching_sub_does_not_raise(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        msg = MagicMock()
+        msg.topic = "unmatched/topic"
+        msg.payload = b"data"
+
+        # Should be a no-op (logs a warning), not raise
+        client._on_message(mock_paho["instance"], None, msg)
