@@ -56,6 +56,43 @@ client = MqttClient.from_config(cfg, client_id="my-client")
 client.start()
 ```
 
+### mTLS (client-certificate authentication)
+
+When the broker authenticates the client via the TLS handshake (no username/password), supply a client cert and key. File-path form:
+
+```python
+cfg = {
+    "host": "broker.example.com",
+    "port": 8883,
+    "use_tls": True,
+    "tls_insecure": False,
+    "tls_ca_cert": "/path/to/ca.pem",
+    "tls_client_cert": "/path/to/client.crt",
+    "tls_client_key": "/path/to/client.key",
+    # "tls_client_key_password": "...",  # only if the key is encrypted
+}
+
+client = MqttClient.from_config(cfg, client_id="my-client")
+client.start()
+```
+
+In-memory form — useful when the cert/key are fetched from a secret store rather than the filesystem. If both the path and `*_data` forms are supplied for the same item, the `*_data` form wins and a warning is logged:
+
+```python
+cfg = {
+    "host": "broker.example.com",
+    "port": 8883,
+    "use_tls": True,
+    "tls_insecure": False,
+    "tls_ca_data": ca_pem_str,
+    "tls_client_cert_data": client_cert_pem_str,
+    "tls_client_key_data": client_key_pem_str,
+}
+
+client = MqttClient.from_config(cfg, client_id="my-client")
+client.start()
+```
+
 ## License
 
 [MIT License](LICENSE) — Copyright (c) 2026 Clark Communications Corporation

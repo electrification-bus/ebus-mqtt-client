@@ -1,5 +1,7 @@
 import logging
+import os
 import ssl
+import tempfile
 import paho.mqtt.client as mqtt
 import paho.mqtt.matcher as matcher
 from typing import Any, Callable, Optional, Union
@@ -32,6 +34,11 @@ class MqttClient:
         tls_ca_cert: Optional[str] = None,
         tls_ca_data: Optional[Union[str, bytes]] = None,
         tls_insecure: Optional[bool] = True,
+        tls_client_cert: Optional[str] = None,
+        tls_client_cert_data: Optional[Union[str, bytes]] = None,
+        tls_client_key: Optional[str] = None,
+        tls_client_key_data: Optional[Union[str, bytes]] = None,
+        tls_client_key_password: Optional[str] = None,
         v5: Optional[bool] = False,
         lwt: Optional[dict] = {},
         on_connect_callback: Optional[Callable] = None,
@@ -80,12 +87,19 @@ class MqttClient:
                     logging.info("reason=mqttClientTlsSecure,ca_data=provided")
                     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                     context.load_verify_locations(cadata=tls_ca_data)
-                    self.mqttc.tls_set_context(context)
                 else:
                     logging.info(f"reason=mqttClientTlsSecure,ca_cert={tls_ca_cert}")
                     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                     context.load_verify_locations(cafile=tls_ca_cert)
-                    self.mqttc.tls_set_context(context)
+                self._load_client_cert_chain(
+                    context,
+                    tls_client_cert,
+                    tls_client_cert_data,
+                    tls_client_key,
+                    tls_client_key_data,
+                    tls_client_key_password,
+                )
+                self.mqttc.tls_set_context(context)
                 self.mqttc.tls_insecure_set(False)
             else:
                 # Insecure mode - skip certificate verification
@@ -93,9 +107,90 @@ class MqttClient:
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 context.check_hostname = False
                 context.verify_mode = ssl.CERT_NONE
+                self._load_client_cert_chain(
+                    context,
+                    tls_client_cert,
+                    tls_client_cert_data,
+                    tls_client_key,
+                    tls_client_key_data,
+                    tls_client_key_password,
+                )
                 self.mqttc.tls_set_context(context)
                 self.mqttc.tls_insecure_set(True)
         self.mqttc.connect(endpoint, port, keepalive=60)
+
+    @staticmethod
+    def _load_client_cert_chain(
+        context: ssl.SSLContext,
+        client_cert: Optional[str],
+        client_cert_data: Optional[Union[str, bytes]],
+        client_key: Optional[str],
+        client_key_data: Optional[Union[str, bytes]],
+        client_key_password: Optional[str],
+    ) -> None:
+        """Load a client certificate (and optional key) into the SSL context for mTLS.
+
+        Prefers the in-memory ``*_data`` form over the file-path form when both are
+        supplied (parallel to the CA cert precedence). ``ssl.SSLContext.load_cert_chain``
+        only accepts file paths, so in-memory data is materialised to a 0600 temp file
+        for the duration of the load and then unlinked.
+        """
+        if not any((client_cert, client_cert_data, client_key, client_key_data)):
+            return
+
+        if client_cert and client_cert_data:
+            logging.warning(
+                "reason=mqttClientTlsClientCertConflict,using=data,ignored=path"
+            )
+        if client_key and client_key_data:
+            logging.warning(
+                "reason=mqttClientTlsClientKeyConflict,using=data,ignored=path"
+            )
+
+        cert_data = client_cert_data if client_cert_data is not None else None
+        key_data = client_key_data if client_key_data is not None else None
+        cert_path = client_cert if cert_data is None else None
+        key_path = client_key if key_data is None else None
+
+        tmp_paths = []
+        try:
+            if cert_data is not None:
+                cert_path = MqttClient._materialise_pem(cert_data, suffix=".crt")
+                tmp_paths.append(cert_path)
+            if key_data is not None:
+                key_path = MqttClient._materialise_pem(key_data, suffix=".key")
+                tmp_paths.append(key_path)
+
+            logging.info(
+                "reason=mqttClientTlsClientCertLoaded,cert=%s,key=%s",
+                "data" if cert_data is not None else cert_path,
+                "data" if key_data is not None else (key_path or "inline-with-cert"),
+            )
+            context.load_cert_chain(
+                certfile=cert_path,
+                keyfile=key_path,
+                password=client_key_password,
+            )
+        finally:
+            for path in tmp_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _materialise_pem(data: Union[str, bytes], suffix: str) -> str:
+        """Write PEM/DER bytes or string to a 0600 temp file and return its path."""
+        if isinstance(data, str):
+            payload = data.encode("utf-8")
+        else:
+            payload = data
+        fd, path = tempfile.mkstemp(suffix=suffix, prefix="ebus-mqtt-")
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        return path
 
     @classmethod
     def from_config(
@@ -116,6 +211,11 @@ class MqttClient:
                 - tls_ca_cert: Path to CA certificate file (optional)
                 - tls_ca_data: CA certificate content as PEM string or DER bytes (optional)
                 - tls_insecure: Skip certificate verification (default: True)
+                - tls_client_cert: Path to client certificate PEM (optional, mTLS)
+                - tls_client_cert_data: Client cert as PEM string or DER bytes (optional, mTLS)
+                - tls_client_key: Path to client private key PEM (optional, mTLS)
+                - tls_client_key_data: Client key as PEM string or DER bytes (optional, mTLS)
+                - tls_client_key_password: Passphrase for an encrypted client key (optional)
                 - authentication: Dict with 'type', 'username', 'password' (optional)
             client_id: MQTT client identifier
             callback: Message callback function (optional)
@@ -131,6 +231,11 @@ class MqttClient:
         tls_ca_cert = mqtt_cfg.get("tls_ca_cert")
         tls_ca_data = mqtt_cfg.get("tls_ca_data")
         tls_insecure = mqtt_cfg.get("tls_insecure", True)
+        tls_client_cert = mqtt_cfg.get("tls_client_cert")
+        tls_client_cert_data = mqtt_cfg.get("tls_client_cert_data")
+        tls_client_key = mqtt_cfg.get("tls_client_key")
+        tls_client_key_data = mqtt_cfg.get("tls_client_key_data")
+        tls_client_key_password = mqtt_cfg.get("tls_client_key_password")
 
         # Extract authentication credentials
         username = None
@@ -155,6 +260,11 @@ class MqttClient:
             tls_ca_cert=tls_ca_cert,
             tls_ca_data=tls_ca_data,
             tls_insecure=tls_insecure,
+            tls_client_cert=tls_client_cert,
+            tls_client_cert_data=tls_client_cert_data,
+            tls_client_key=tls_client_key,
+            tls_client_key_data=tls_client_key_data,
+            tls_client_key_password=tls_client_key_password,
             lwt=lwt or {},
             on_connect_callback=on_connect_callback,
         )

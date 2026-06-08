@@ -1,3 +1,4 @@
+import os
 import ssl
 from unittest.mock import patch, MagicMock, PropertyMock
 import pytest
@@ -146,6 +147,187 @@ class TestTLS:
             mock_ctx_cls.assert_not_called()
 
 
+class TestMtls:
+    def test_client_cert_path_with_ca(self, mock_paho):
+        """Client cert + key paths are passed straight to load_cert_chain."""
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx_cls.return_value = mock_ctx
+            MqttClient(
+                client_id="test",
+                endpoint="localhost",
+                port=8883,
+                use_tls=True,
+                tls_ca_cert="/path/to/ca.pem",
+                tls_insecure=False,
+                tls_client_cert="/path/to/client.crt",
+                tls_client_key="/path/to/client.key",
+            )
+            mock_ctx.load_cert_chain.assert_called_once_with(
+                certfile="/path/to/client.crt",
+                keyfile="/path/to/client.key",
+                password=None,
+            )
+
+    def test_client_cert_path_in_insecure_mode(self, mock_paho):
+        """mTLS still works when the server cert is not verified (self-signed broker)."""
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx_cls.return_value = mock_ctx
+            MqttClient(
+                client_id="test",
+                endpoint="localhost",
+                port=8883,
+                use_tls=True,
+                tls_insecure=True,
+                tls_client_cert="/path/to/client.crt",
+                tls_client_key="/path/to/client.key",
+            )
+            mock_ctx.load_cert_chain.assert_called_once_with(
+                certfile="/path/to/client.crt",
+                keyfile="/path/to/client.key",
+                password=None,
+            )
+
+    def test_client_cert_data_materialised_to_tempfile(self, mock_paho):
+        """In-memory PEM data is written to a temp file load_cert_chain can read."""
+        cert_pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+        key_pem = "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n"
+        seen = {}
+
+        def fake_load(certfile, keyfile, password):
+            # Capture the temp paths' contents before they're unlinked.
+            with open(certfile, "rb") as f:
+                seen["cert"] = f.read()
+            with open(keyfile, "rb") as f:
+                seen["key"] = f.read()
+            seen["cert_path"] = certfile
+            seen["key_path"] = keyfile
+
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx.load_cert_chain.side_effect = fake_load
+            mock_ctx_cls.return_value = mock_ctx
+            MqttClient(
+                client_id="test",
+                endpoint="localhost",
+                port=8883,
+                use_tls=True,
+                tls_ca_data="CA-PEM",
+                tls_insecure=False,
+                tls_client_cert_data=cert_pem,
+                tls_client_key_data=key_pem,
+            )
+            assert seen["cert"] == cert_pem.encode("utf-8")
+            assert seen["key"] == key_pem.encode("utf-8")
+            # Temp files cleaned up after the load returned.
+            assert not os.path.exists(seen["cert_path"])
+            assert not os.path.exists(seen["key_path"])
+
+    def test_client_key_data_as_bytes(self, mock_paho):
+        """DER bytes (not PEM string) flow through unchanged."""
+        cert_der = b"\x30\x82\x01\x00fake-cert-der"
+        key_der = b"\x30\x82\x02\x00fake-key-der"
+        seen = {}
+
+        def fake_load(certfile, keyfile, password):
+            with open(certfile, "rb") as f:
+                seen["cert"] = f.read()
+            with open(keyfile, "rb") as f:
+                seen["key"] = f.read()
+
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx.load_cert_chain.side_effect = fake_load
+            mock_ctx_cls.return_value = mock_ctx
+            MqttClient(
+                client_id="test",
+                endpoint="localhost",
+                port=8883,
+                use_tls=True,
+                tls_insecure=True,
+                tls_client_cert_data=cert_der,
+                tls_client_key_data=key_der,
+            )
+            assert seen["cert"] == cert_der
+            assert seen["key"] == key_der
+
+    def test_client_key_password_passed_through(self, mock_paho):
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx_cls.return_value = mock_ctx
+            MqttClient(
+                client_id="test",
+                endpoint="localhost",
+                port=8883,
+                use_tls=True,
+                tls_insecure=True,
+                tls_client_cert="/path/to/client.crt",
+                tls_client_key="/path/to/client.key",
+                tls_client_key_password="hunter2",
+            )
+            _, kwargs = mock_ctx.load_cert_chain.call_args
+            assert kwargs["password"] == "hunter2"
+
+    def test_combined_cert_and_key_in_one_pem(self, mock_paho):
+        """Cert PEM may contain the key; keyfile=None is the documented signal."""
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx_cls.return_value = mock_ctx
+            MqttClient(
+                client_id="test",
+                endpoint="localhost",
+                port=8883,
+                use_tls=True,
+                tls_insecure=True,
+                tls_client_cert="/path/to/combined.pem",
+            )
+            mock_ctx.load_cert_chain.assert_called_once_with(
+                certfile="/path/to/combined.pem",
+                keyfile=None,
+                password=None,
+            )
+
+    def test_data_form_wins_over_path_with_warning(self, mock_paho, caplog):
+        """When both *_data and the path are given, prefer *_data and warn."""
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx_cls.return_value = mock_ctx
+            with caplog.at_level("WARNING"):
+                MqttClient(
+                    client_id="test",
+                    endpoint="localhost",
+                    port=8883,
+                    use_tls=True,
+                    tls_insecure=True,
+                    tls_client_cert="/path/to/ignored.crt",
+                    tls_client_cert_data="PEM-DATA",
+                    tls_client_key="/path/to/ignored.key",
+                    tls_client_key_data="KEY-DATA",
+                )
+            kwargs = mock_ctx.load_cert_chain.call_args.kwargs
+            assert kwargs["certfile"] != "/path/to/ignored.crt"
+            assert kwargs["keyfile"] != "/path/to/ignored.key"
+            warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+            assert any("ClientCertConflict" in m for m in warnings)
+            assert any("ClientKeyConflict" in m for m in warnings)
+
+    def test_no_mtls_when_no_client_cert_supplied(self, mock_paho):
+        """Server-only TLS still works — load_cert_chain is NOT called."""
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx_cls.return_value = mock_ctx
+            MqttClient(
+                client_id="test",
+                endpoint="localhost",
+                port=8883,
+                use_tls=True,
+                tls_ca_cert="/path/to/ca.pem",
+                tls_insecure=False,
+            )
+            mock_ctx.load_cert_chain.assert_not_called()
+
+
 class TestFromConfig:
     def test_defaults(self, mock_paho):
         client = MqttClient.from_config({}, client_id="cfg-test")
@@ -195,6 +377,36 @@ class TestFromConfig:
             {}, client_id="cfg-test", lwt=lwt
         )
         mock_paho["instance"].will_set.assert_called_once()
+
+    def test_mtls_config_path_form(self, mock_paho):
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx_cls.return_value = mock_ctx
+            cfg = {
+                "use_tls": True,
+                "tls_insecure": False,
+                "tls_ca_cert": "/ca.pem",
+                "tls_client_cert": "/client.crt",
+                "tls_client_key": "/client.key",
+                "tls_client_key_password": "pw",
+            }
+            MqttClient.from_config(cfg, client_id="cfg-test")
+            mock_ctx.load_cert_chain.assert_called_once_with(
+                certfile="/client.crt", keyfile="/client.key", password="pw"
+            )
+
+    def test_mtls_config_data_form(self, mock_paho):
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx_cls.return_value = mock_ctx
+            cfg = {
+                "use_tls": True,
+                "tls_insecure": True,
+                "tls_client_cert_data": "CERT-PEM",
+                "tls_client_key_data": "KEY-PEM",
+            }
+            MqttClient.from_config(cfg, client_id="cfg-test")
+            mock_ctx.load_cert_chain.assert_called_once()
 
 
 class TestSubscriptions:
