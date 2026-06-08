@@ -93,6 +93,10 @@ client = MqttClient.from_config(cfg, client_id="my-client")
 client.start()
 ```
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to file Discussions, Issues, and pull requests. The library is intentionally a thin MQTT-only layer — Homie / eBus features belong in [`ebus-sdk`](https://github.com/electrification-bus/python-sdk).
+
 ## License
 
 [MIT License](LICENSE) — Copyright (c) 2026 Clark Communications Corporation
