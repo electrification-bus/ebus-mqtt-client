@@ -442,6 +442,54 @@ class TestSubscriptions:
         on_connect.assert_called_once()
 
 
+class TestUnsubscribe:
+    def test_unsubscribe_removes_callback_and_calls_paho(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("sensors/#", handler, qos=1)
+
+        result = client.unsubscribe("sensors/#")
+
+        assert result is True
+        assert "sensors/#" not in client.sub_callbacks
+        mock_paho["instance"].unsubscribe.assert_called_once_with("sensors/#")
+
+    def test_unsubscribe_stops_message_dispatch(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("sensors/+", handler, qos=1)
+        client.unsubscribe("sensors/+")
+
+        msg = MagicMock()
+        msg.topic = "sensors/a"
+        msg.payload = b"x"
+        client._on_message(mock_paho["instance"], None, msg)
+
+        handler.assert_not_called()
+
+    def test_unsubscribe_unknown_returns_false_and_no_paho_call(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        result = client.unsubscribe("never/subscribed")
+
+        assert result is False
+        mock_paho["instance"].unsubscribe.assert_not_called()
+
+    def test_unsubscribed_not_restored_on_reconnect(self, mock_paho):
+        """After unsubscribe, on-reconnect recovery must not resurrect the filter."""
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("a/#", handler, qos=1)
+        client.subscribe("b/#", handler, qos=1)
+        client.unsubscribe("a/#")
+
+        mock_paho["instance"].subscribe.reset_mock()
+        client._on_connect(mock_paho["instance"], None, {}, 0)
+
+        # Only "b/#" should be re-subscribed; "a/#" was unsubscribed
+        subscribed_filters = [c[0][0] for c in mock_paho["instance"].subscribe.call_args_list]
+        assert subscribed_filters == ["b/#"]
+
+
 class TestPublish:
     def test_publish_calls_paho(self, mock_paho):
         client = MqttClient(client_id="test", endpoint="localhost", port=1883)

@@ -13,7 +13,7 @@ from setuptools import setup
 
 setup(
     name="ebus-mqtt-client",
-    version="0.1.5",
+    version="0.1.6",
     package_dir={"": "src"},
     packages=["ebus_mqtt_client"],
 )

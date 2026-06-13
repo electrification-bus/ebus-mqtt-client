@@ -312,6 +312,36 @@ class MqttClient:
         self.sub_matcher[sub] = sub
         self.mqttc.subscribe(sub, qos)
 
+    def unsubscribe(self, sub: str) -> bool:
+        """Unsubscribe from a previously-subscribed topic filter.
+
+        Removes the local callback and matcher entry so a re-publish on the
+        same filter won't dispatch, then sends UNSUBSCRIBE to the broker. The
+        local cleanup also ensures the filter won't be re-subscribed by the
+        on-reconnect recovery path.
+
+        Returns True if the filter was known and removed; False otherwise. A
+        no-op for unknown filters (matches paho's tolerant behavior).
+        """
+        if not hasattr(self, "mqttc"):
+            logging.error(
+                f"reason=mqttUnsubscribeNoClient,client={self.client_id},sub={sub}"
+            )
+            return False
+        if sub not in self.sub_callbacks:
+            logging.debug(
+                f"reason=mqttUnsubscribeUnknownSub,client={self.client_id},sub={sub}"
+            )
+            return False
+        del self.sub_callbacks[sub]
+        try:
+            del self.sub_matcher[sub]
+        except KeyError:
+            pass
+        self.mqttc.unsubscribe(sub)
+        logging.info(f"reason=mqttUnsubscribed,client={self.client_id},sub={sub}")
+        return True
+
     def _on_connect(self, mqttc: mqtt.Client, userdata: Any, flags: int, rc: int):
         logging.info(f"reason=mqttBrokerConnected,client={self.client_id}")
 
