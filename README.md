@@ -14,6 +14,8 @@ Standalone MQTT client wrapper around [paho-mqtt](https://pypi.org/project/paho-
 - Last Will and Testament (LWT)
 - MQTTv3 and MQTTv5 protocol support
 - Factory method for dict-based configuration
+- Bounded, broker-independent shutdown: `stop(timeout=...)` returns promptly even against a dead broker
+- Bounded publish flush: `publish_and_flush(...)` lands a final message before a clean disconnect, no fixed sleep
 
 ## Install
 
@@ -38,6 +40,24 @@ client.publish("sensors/temp", "22.5")
 
 client.stop()
 ```
+
+### Graceful shutdown
+
+Publish a final retained message and flush it (bounded) before disconnecting, then stop within a time bound even when the broker is unreachable:
+
+```python
+# Land a final state update, waiting up to 1s for it to actually be sent.
+# Returns True on flush; False (without blocking or raising) if not connected,
+# the publish fails, or the flush exceeds the timeout.
+client.publish_and_flush(
+    "devices/my-client/state", "disconnected", retain=True, timeout=1.0
+)
+
+# Returns within ~timeout seconds even if the broker is gone.
+client.stop(timeout=2.0)
+```
+
+`publish()` also returns paho's `MQTTMessageInfo` (or `None` if there is no client), so you can wait for a single message yourself: `client.publish(topic, data).wait_for_publish(1.0)`.
 
 ### From a config dict
 
