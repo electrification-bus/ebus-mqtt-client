@@ -4,6 +4,8 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-11
+
 ### Added
 
 - `MqttClient.publish_and_flush(topic, data, qos=1, retain=False, timeout=1.0) -> bool`: publish a message and bounded-wait until it is actually sent to the broker. Returns `True` once flushed; returns `False` immediately (never raising, never blocking indefinitely) when there is no client, the client is not connected, the publish result code is a failure, or the flush does not complete within `timeout`. Lets a caller land a final retained message (for example a graceful state update) before a clean disconnect without a fixed sleep. (EMQTT-yn2)
