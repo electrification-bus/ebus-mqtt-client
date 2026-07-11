@@ -1,5 +1,7 @@
 import os
 import ssl
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -548,6 +550,44 @@ class TestStartStop:
         mock_paho["instance"].disconnect.assert_called_once()
         mock_paho["instance"].loop_stop.assert_called_once()
         assert len(client.sub_callbacks) == 0
+
+    def test_stop_accepts_timeout(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        client.start()
+        client.stop(timeout=0.5)
+        mock_paho["instance"].loop_stop.assert_called_once()
+
+    def test_stop_shortens_reconnect_backoff(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        client.stop()
+        # The last reconnect_delay_set call (during stop) caps the backoff at 1s
+        # so the network thread is not parked in a long sleep.
+        mock_paho["instance"].reconnect_delay_set.assert_called_with(min_delay=1, max_delay=1)
+
+    def test_stop_bounded_when_loop_stop_hangs(self, mock_paho):
+        # Simulate a wedged network thread: loop_stop() blocks. stop() must still
+        # return within its timeout rather than joining the hung thread.
+        release = threading.Event()
+        mock_paho["instance"].loop_stop.side_effect = lambda: release.wait(5)
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("test/#", handler)
+        client.start()
+
+        start = time.monotonic()
+        client.stop(timeout=0.2)
+        elapsed = time.monotonic() - start
+        release.set()  # let the daemon helper unwind
+
+        assert elapsed < 1.0
+        assert client.is_running is False
+        assert len(client.sub_callbacks) == 0
+
+    def test_stop_no_client_does_not_raise(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        del client.mqttc
+        client.stop()  # must not raise even with no underlying client
+        assert client.is_running is False
 
 
 class TestIsConnected:

@@ -3,6 +3,7 @@ import logging
 import os
 import ssl
 import tempfile
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -272,14 +273,52 @@ class MqttClient:
         else:
             self.mqttc.loop_start()
 
-    def stop(self):
+    def stop(self, timeout: float = 2.0):
+        """Stop the client within a small, broker-independent time bound.
+
+        Shutdown must not depend on the broker being reachable. On a coordinated
+        gateway reboot the broker can stop before its consumers, so stop() may run
+        against a dead broker; a stop() that blocks then eats the service's
+        SIGTERM budget and stalls the reboot.
+
+        paho's ``loop_stop()`` joins the network thread with no timeout, which can
+        stall the caller if that thread is wedged in a socket op or a reconnect
+        backoff sleep. The paho 2.x network thread is a daemon, so it never blocks
+        interpreter exit; we therefore run the potentially-blocking disconnect and
+        loop_stop() in a helper thread and bound our wait on it with ``timeout``.
+        If shutdown does not finish in time we return anyway and rely on the daemon
+        thread plus the LWT (set at construction) to signal that we are gone. We do
+        a best-effort clean DISCONNECT (to suppress the LWT when the broker is
+        alive) but never depend on the broker ACKing it.
+        """
         self.is_running = False
-        self.mqttc.disconnect()
-        self.mqttc.loop_stop()
+        if hasattr(self, "mqttc"):
+            # Shorten any future reconnect backoff so the network thread is not
+            # parked in a long sleep we would otherwise have to wait out.
+            with contextlib.suppress(Exception):
+                self.mqttc.reconnect_delay_set(min_delay=1, max_delay=1)
+            shutdown = threading.Thread(
+                target=self._shutdown_mqttc,
+                name=f"mqtt-stop-{self.client_id}",
+                daemon=True,
+            )
+            shutdown.start()
+            shutdown.join(timeout)
+            if shutdown.is_alive():
+                logging.warning(f"reason=mqttStopTimeout,client={self.client_id},timeout={timeout}")
         # Release subscription callbacks and matcher to free memory
         self.sub_callbacks.clear()
         self.sub_matcher = matcher.MQTTMatcher()
         self.on_connect_callback = None
+
+    def _shutdown_mqttc(self):
+        """Best-effort disconnect + loop_stop; runs in a bounded helper thread."""
+        with contextlib.suppress(Exception):
+            self.mqttc.disconnect()
+        try:
+            self.mqttc.loop_stop()
+        except Exception:
+            logging.warning(f"reason=mqttLoopStopException,client={self.client_id}", exc_info=True)
 
     def publish(
         self, topic: str, data: str, qos: int = 1, retain: bool = False
