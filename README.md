@@ -1,5 +1,8 @@
 # ebus-mqtt-client
 
+[![PyPI version](https://img.shields.io/pypi/v/ebus-mqtt-client.svg)](https://pypi.org/project/ebus-mqtt-client/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 Standalone MQTT client wrapper around [paho-mqtt](https://pypi.org/project/paho-mqtt/) v2.
 
 ## Features
