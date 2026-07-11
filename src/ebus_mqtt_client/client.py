@@ -281,14 +281,65 @@ class MqttClient:
         self.sub_matcher = matcher.MQTTMatcher()
         self.on_connect_callback = None
 
-    def publish(self, topic: str, data: str, qos: int = 1, retain: bool = False):
+    def publish(
+        self, topic: str, data: str, qos: int = 1, retain: bool = False
+    ) -> mqtt.MQTTMessageInfo | None:
+        """Publish a message and return paho's MQTTMessageInfo (or None if no client).
+
+        Returning the message info lets a caller optionally wait for the message
+        to be flushed to the broker via ``msg_info.wait_for_publish(timeout)``.
+        See :meth:`publish_and_flush` for a bounded convenience wrapper.
+        """
         if not hasattr(self, "mqttc"):
             logging.error(f"reason=mqttPublishNoClient,client={self.client_id},topic={topic}")
-            return
+            return None
         msg_info = self.mqttc.publish(topic, data, qos, retain)
 
         if msg_info.rc != mqtt.MQTT_ERR_SUCCESS:
             logging.warning(f"reason=mqttPublishFail,client={self.client_id},topic={topic}")
+        return msg_info
+
+    def publish_and_flush(
+        self,
+        topic: str,
+        data: str,
+        qos: int = 1,
+        retain: bool = False,
+        timeout: float = 1.0,
+    ) -> bool:
+        """Publish a message and wait, bounded, until it is flushed to the broker.
+
+        Publishes ``data`` to ``topic`` and then blocks for at most ``timeout``
+        seconds waiting for the message to be sent (``wait_for_publish``). Useful
+        for landing a final retained message (e.g. a graceful state update) right
+        before a clean disconnect, without resorting to a fixed sleep.
+
+        Always bounded and safe: never blocks indefinitely, and never raises for
+        the common failure modes. Returns True once the message is published;
+        returns False immediately if there is no client or the client is not
+        connected, if the publish call itself fails, or if the flush does not
+        complete within ``timeout``.
+        """
+        if not hasattr(self, "mqttc"):
+            logging.error(f"reason=mqttPublishFlushNoClient,client={self.client_id},topic={topic}")
+            return False
+        if not self.mqttc.is_connected():
+            logging.warning(
+                f"reason=mqttPublishFlushNotConnected,client={self.client_id},topic={topic}"
+            )
+            return False
+        msg_info = self.mqttc.publish(topic, data, qos, retain)
+        if msg_info.rc != mqtt.MQTT_ERR_SUCCESS:
+            logging.warning(f"reason=mqttPublishFail,client={self.client_id},topic={topic}")
+            return False
+        try:
+            msg_info.wait_for_publish(timeout)
+        except (RuntimeError, ValueError) as e:
+            logging.warning(
+                f"reason=mqttPublishFlushTimeout,client={self.client_id},topic={topic},err={e}"
+            )
+            return False
+        return msg_info.is_published()
 
     def subscribe(self, sub: str, param: Any, qos: int = 1):
         if not hasattr(self, "mqttc"):

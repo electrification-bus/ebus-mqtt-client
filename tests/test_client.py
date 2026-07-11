@@ -476,6 +476,59 @@ class TestPublish:
         client.publish("topic/a", "data", qos=0, retain=True)
         mock_paho["instance"].publish.assert_called_once_with("topic/a", "data", 0, True)
 
+    def test_publish_returns_msg_info(self, mock_paho):
+        msg_info = MagicMock(rc=0)
+        mock_paho["instance"].publish.return_value = msg_info
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        assert client.publish("topic/a", "data") is msg_info
+
+    def test_publish_no_client_returns_none(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        del client.mqttc
+        assert client.publish("topic/a", "data") is None
+
+
+class TestPublishAndFlush:
+    def test_flush_success(self, mock_paho):
+        msg_info = MagicMock(rc=0)
+        msg_info.is_published.return_value = True
+        mock_paho["instance"].is_connected.return_value = True
+        mock_paho["instance"].publish.return_value = msg_info
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+
+        assert client.publish_and_flush("topic/a", "data", timeout=0.5) is True
+        msg_info.wait_for_publish.assert_called_once_with(0.5)
+
+    def test_flush_not_connected_returns_false_without_publish(self, mock_paho):
+        mock_paho["instance"].is_connected.return_value = False
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+
+        assert client.publish_and_flush("topic/a", "data") is False
+        mock_paho["instance"].publish.assert_not_called()
+
+    def test_flush_no_client_returns_false(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        del client.mqttc
+        assert client.publish_and_flush("topic/a", "data") is False
+
+    def test_flush_publish_rc_failure_returns_false(self, mock_paho):
+        msg_info = MagicMock(rc=1)  # non-zero rc == failure
+        mock_paho["instance"].is_connected.return_value = True
+        mock_paho["instance"].publish.return_value = msg_info
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+
+        assert client.publish_and_flush("topic/a", "data") is False
+        msg_info.wait_for_publish.assert_not_called()
+
+    def test_flush_timeout_returns_false(self, mock_paho):
+        msg_info = MagicMock(rc=0)
+        msg_info.wait_for_publish.side_effect = RuntimeError("not published yet")
+        mock_paho["instance"].is_connected.return_value = True
+        mock_paho["instance"].publish.return_value = msg_info
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+
+        assert client.publish_and_flush("topic/a", "data", timeout=0.1) is False
+
 
 class TestStartStop:
     def test_start_nonblocking(self, mock_paho):
