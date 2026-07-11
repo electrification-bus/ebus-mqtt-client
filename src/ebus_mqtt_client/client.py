@@ -1,10 +1,13 @@
+import contextlib
 import logging
 import os
 import ssl
 import tempfile
+from collections.abc import Callable
+from typing import Any
+
 import paho.mqtt.client as mqtt
 import paho.mqtt.matcher as matcher
-from typing import Any, Callable, Optional, Union
 
 # Default broker configuration
 MQTT_DEFAULT_HOST = "127.0.0.1"
@@ -27,31 +30,29 @@ class MqttClient:
         client_id: str,
         endpoint: str,
         port: int,
-        callback: Callable[[Union[bytes, bytearray], Any], None] = None,
+        callback: Callable[[bytes | bytearray, Any], None] = None,
         username=None,
         password=None,
-        use_tls: Optional[bool] = False,
-        tls_ca_cert: Optional[str] = None,
-        tls_ca_data: Optional[Union[str, bytes]] = None,
-        tls_insecure: Optional[bool] = True,
-        tls_client_cert: Optional[str] = None,
-        tls_client_cert_data: Optional[Union[str, bytes]] = None,
-        tls_client_key: Optional[str] = None,
-        tls_client_key_data: Optional[Union[str, bytes]] = None,
-        tls_client_key_password: Optional[str] = None,
-        v5: Optional[bool] = False,
-        lwt: Optional[dict] = {},
-        on_connect_callback: Optional[Callable] = None,
+        use_tls: bool | None = False,
+        tls_ca_cert: str | None = None,
+        tls_ca_data: str | bytes | None = None,
+        tls_insecure: bool | None = True,
+        tls_client_cert: str | None = None,
+        tls_client_cert_data: str | bytes | None = None,
+        tls_client_key: str | None = None,
+        tls_client_key_data: str | bytes | None = None,
+        tls_client_key_password: str | None = None,
+        v5: bool | None = False,
+        lwt: dict | None = None,
+        on_connect_callback: Callable | None = None,
     ):
         self.client_id = client_id
         try:
             if v5:
-                self.mqttc = mqtt.Client(
-                    client_id=self.client_id, protocol=mqtt.MQTTv5
-                )
+                self.mqttc = mqtt.Client(client_id=self.client_id, protocol=mqtt.MQTTv5)
             else:
                 self.mqttc = mqtt.Client(client_id=self.client_id)
-        except Exception as e:
+        except Exception:
             logging.exception("reason=mqttClientInstantiationException")
 
         # Last Will and Testament
@@ -122,11 +123,11 @@ class MqttClient:
     @staticmethod
     def _load_client_cert_chain(
         context: ssl.SSLContext,
-        client_cert: Optional[str],
-        client_cert_data: Optional[Union[str, bytes]],
-        client_key: Optional[str],
-        client_key_data: Optional[Union[str, bytes]],
-        client_key_password: Optional[str],
+        client_cert: str | None,
+        client_cert_data: str | bytes | None,
+        client_key: str | None,
+        client_key_data: str | bytes | None,
+        client_key_password: str | None,
     ) -> None:
         """Load a client certificate (and optional key) into the SSL context for mTLS.
 
@@ -139,13 +140,9 @@ class MqttClient:
             return
 
         if client_cert and client_cert_data:
-            logging.warning(
-                "reason=mqttClientTlsClientCertConflict,using=data,ignored=path"
-            )
+            logging.warning("reason=mqttClientTlsClientCertConflict,using=data,ignored=path")
         if client_key and client_key_data:
-            logging.warning(
-                "reason=mqttClientTlsClientKeyConflict,using=data,ignored=path"
-            )
+            logging.warning("reason=mqttClientTlsClientKeyConflict,using=data,ignored=path")
 
         cert_data = client_cert_data if client_cert_data is not None else None
         key_data = client_key_data if client_key_data is not None else None
@@ -173,18 +170,13 @@ class MqttClient:
             )
         finally:
             for path in tmp_paths:
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(path)
-                except OSError:
-                    pass
 
     @staticmethod
-    def _materialise_pem(data: Union[str, bytes], suffix: str) -> str:
+    def _materialise_pem(data: str | bytes, suffix: str) -> str:
         """Write PEM/DER bytes or string to a 0600 temp file and return its path."""
-        if isinstance(data, str):
-            payload = data.encode("utf-8")
-        else:
-            payload = data
+        payload = data.encode("utf-8") if isinstance(data, str) else data
         fd, path = tempfile.mkstemp(suffix=suffix, prefix="ebus-mqtt-")
         try:
             os.write(fd, payload)
@@ -197,9 +189,9 @@ class MqttClient:
         cls,
         mqtt_cfg: dict,
         client_id: str,
-        callback: Callable[[Union[bytes, bytearray], Any], None] = None,
-        lwt: Optional[dict] = None,
-        on_connect_callback: Optional[Callable] = None,
+        callback: Callable[[bytes | bytearray, Any], None] = None,
+        lwt: dict | None = None,
+        on_connect_callback: Callable | None = None,
     ) -> "MqttClient":
         """Create an MqttClient from a configuration dictionary.
 
@@ -291,22 +283,16 @@ class MqttClient:
 
     def publish(self, topic: str, data: str, qos: int = 1, retain: bool = False):
         if not hasattr(self, "mqttc"):
-            logging.error(
-                f"reason=mqttPublishNoClient,client={self.client_id},topic={topic}"
-            )
+            logging.error(f"reason=mqttPublishNoClient,client={self.client_id},topic={topic}")
             return
         msg_info = self.mqttc.publish(topic, data, qos, retain)
 
         if msg_info.rc != mqtt.MQTT_ERR_SUCCESS:
-            logging.warning(
-                f"reason=mqttPublishFail,client={self.client_id},topic={topic}"
-            )
+            logging.warning(f"reason=mqttPublishFail,client={self.client_id},topic={topic}")
 
     def subscribe(self, sub: str, param: Any, qos: int = 1):
         if not hasattr(self, "mqttc"):
-            logging.error(
-                f"reason=mqttSubscribeNoClient,client={self.client_id},sub={sub}"
-            )
+            logging.error(f"reason=mqttSubscribeNoClient,client={self.client_id},sub={sub}")
             return
         self.sub_callbacks[sub] = (param, qos)
         self.sub_matcher[sub] = sub
@@ -324,20 +310,14 @@ class MqttClient:
         no-op for unknown filters (matches paho's tolerant behavior).
         """
         if not hasattr(self, "mqttc"):
-            logging.error(
-                f"reason=mqttUnsubscribeNoClient,client={self.client_id},sub={sub}"
-            )
+            logging.error(f"reason=mqttUnsubscribeNoClient,client={self.client_id},sub={sub}")
             return False
         if sub not in self.sub_callbacks:
-            logging.debug(
-                f"reason=mqttUnsubscribeUnknownSub,client={self.client_id},sub={sub}"
-            )
+            logging.debug(f"reason=mqttUnsubscribeUnknownSub,client={self.client_id},sub={sub}")
             return False
         del self.sub_callbacks[sub]
-        try:
+        with contextlib.suppress(KeyError):
             del self.sub_matcher[sub]
-        except KeyError:
-            pass
         self.mqttc.unsubscribe(sub)
         logging.info(f"reason=mqttUnsubscribed,client={self.client_id},sub={sub}")
         return True
@@ -349,22 +329,16 @@ class MqttClient:
         for sub, (_, qos) in list(self.sub_callbacks.items()):
             result, msg_id = self.mqttc.subscribe(sub, qos)
             if result == mqtt.MQTT_ERR_SUCCESS:
-                logging.info(
-                    f"reason=mqttSubscribeSuccess,client={self.client_id},sub={sub}"
-                )
+                logging.info(f"reason=mqttSubscribeSuccess,client={self.client_id},sub={sub}")
             else:
-                logging.warning(
-                    f"reason=mqttSubscribeFail,client={self.client_id},sub={sub}"
-                )
+                logging.warning(f"reason=mqttSubscribeFail,client={self.client_id},sub={sub}")
         # Invoke supplied on_connect_callback if provided
         if self.on_connect_callback:
             self.on_connect_callback()
 
     def _on_disconnect(self, mqttc: mqtt.Client, userdata: Any, rc: int):
         if self.is_running and rc != mqtt.MQTT_ERR_SUCCESS:
-            logging.warning(
-                f"reason=mqttBrokerConnectionLost,rc={rc},client={self.client_id}"
-            )
+            logging.warning(f"reason=mqttBrokerConnectionLost,rc={rc},client={self.client_id}")
         else:
             logging.info(f"reason=mqttBrokerDisconnected,client={self.client_id}")
 
@@ -377,7 +351,7 @@ class MqttClient:
     def _on_message(self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage):
         try:
             sub = self._find_matching_sub(msg.topic)
-        except:
+        except Exception:
             logging.warning(
                 f"reason=onMessageFindMatchingSubException,topic={msg.topic}",
                 exc_info=True,
@@ -393,7 +367,7 @@ class MqttClient:
                 userdata(msg.topic, msg.payload, self.sub_callbacks[sub][0])
             else:
                 self.sub_callbacks[sub][0](msg.topic, msg.payload)
-        except:
+        except Exception:
             logging.warning(
                 f"reason=onMessageClientCallbackException,topic={msg.topic}",
                 exc_info=True,
