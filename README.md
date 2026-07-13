@@ -116,6 +116,18 @@ client = MqttClient.from_config(cfg, client_id="my-client")
 client.start()
 ```
 
+## Releasing
+
+The version lives in exactly one place: `__version__` in `src/ebus_mqtt_client/__init__.py`. `pyproject.toml` reads it dynamically, the `setup.py` legacy shim reads it by regex, and the publish workflow refuses to release a tag that disagrees with it. To cut a release:
+
+1. Bump `__version__` in `src/ebus_mqtt_client/__init__.py` (the only place).
+2. Move the CHANGELOG's `[Unreleased]` entries under a new version heading.
+3. Commit: `git commit -am "Release X.Y.Z"`.
+4. Tag it to match, `v`-prefixed: `git tag vX.Y.Z`.
+5. Push the tag: `git push --tags` (a plain `git push` does not trigger a release).
+
+Pushing a `v*` tag runs the publish workflow, which verifies the tag equals `v$__version__` (a mismatch fails before anything is built), builds the sdist and wheel, and publishes to PyPI via Trusted Publishing (OIDC, no stored token).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how to file Discussions, Issues, and pull requests. The library is intentionally a thin MQTT-only layer — Homie / eBus features belong in [`ebus-sdk`](https://github.com/electrification-bus/python-sdk).

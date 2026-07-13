@@ -6,14 +6,24 @@ packages are needed only so that older setuptools (e.g. the 59.5.0 pinned in
 Yocto kirkstone) can build a wheel with correct metadata from the sdist —
 without this shim the legacy build produces an UNKNOWN-0.0.0 wheel.
 
-Keep name and version in sync with pyproject.toml [project].
+The version is read from src/ebus_mqtt_client/__init__.py's __version__ (the
+single source of truth) so the legacy build cannot drift from the modern one.
 """
+
+import re
+from pathlib import Path
 
 from setuptools import setup
 
+version = re.search(
+    r'^__version__ = "([^"]+)"',
+    Path("src/ebus_mqtt_client/__init__.py").read_text(encoding="utf-8"),
+    re.M,
+).group(1)
+
 setup(
     name="ebus-mqtt-client",
-    version="0.1.7",
+    version=version,
     package_dir={"": "src"},
     packages=["ebus_mqtt_client"],
 )

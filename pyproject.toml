@@ -4,7 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ebus-mqtt-client"
-version = "0.1.7"
+# Single source of truth: src/ebus_mqtt_client/__init__.py's __version__ (read
+# dynamically below, and by setup.py's legacy path). Bump it in ONE place; a
+# publish.yml guard fails the release if the git tag disagrees.
+dynamic = ["version"]
 description = "Standalone MQTT client wrapper around paho-mqtt with TLS, reconnection, subscription recovery, and topic pattern matching"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,6 +38,9 @@ dev = ["pytest", "ruff>=0.15.0"]
 Homepage = "https://ebus.energy"
 Repository = "https://github.com/electrification-bus/ebus-mqtt-client"
 Issues = "https://github.com/electrification-bus/ebus-mqtt-client/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "ebus_mqtt_client.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
