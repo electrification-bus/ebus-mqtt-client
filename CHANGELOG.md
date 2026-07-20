@@ -12,27 +12,27 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ### Changed
 
-- Adopted the eBus "version single source of truth" convention: `__version__` in `src/ebus_mqtt_client/__init__.py` is now the one place the version is written (and is importable at runtime). `pyproject.toml` resolves it dynamically (`dynamic = ["version"]` + `[tool.setuptools.dynamic]`), the `setup.py` legacy shim reads it by regex instead of a hardcoded literal, and the publish workflow gained a "Verify tag matches package version" guard that fails a release whose `v*` tag disagrees with `__version__`. A `## Releasing` section documenting the flow was added to the README. (EMQTT-95f)
+- Adopted the eBus "version single source of truth" convention: `__version__` in `src/ebus_mqtt_client/__init__.py` is now the one place the version is written (and is importable at runtime). `pyproject.toml` resolves it dynamically (`dynamic = ["version"]` + `[tool.setuptools.dynamic]`), the `setup.py` legacy shim reads it by regex instead of a hardcoded literal, and the publish workflow gained a "Verify tag matches package version" guard that fails a release whose `v*` tag disagrees with `__version__`. A `## Releasing` section documenting the flow was added to the README.
 
 ## [0.1.7] - 2026-07-11
 
 ### Added
 
-- `MqttClient.publish_and_flush(topic, data, qos=1, retain=False, timeout=1.0) -> bool`: publish a message and bounded-wait until it is actually sent to the broker. Returns `True` once flushed; returns `False` immediately (never raising, never blocking indefinitely) when there is no client, the client is not connected, the publish result code is a failure, or the flush does not complete within `timeout`. Lets a caller land a final retained message (for example a graceful state update) before a clean disconnect without a fixed sleep. (EMQTT-yn2)
-- Ruff formatting and linting: a `[tool.ruff]` config (line-length 100, target py310, the E/W/F/I/B/UP/SIM lint set), a `ruff-pre-commit` hook, and a `lint.yml` CI job running `ruff check` and `ruff format --check`. (EMQTT-73n)
-- PyPI version and Ruff badges in the README. (EMQTT-9b3)
+- `MqttClient.publish_and_flush(topic, data, qos=1, retain=False, timeout=1.0) -> bool`: publish a message and bounded-wait until it is actually sent to the broker. Returns `True` once flushed; returns `False` immediately (never raising, never blocking indefinitely) when there is no client, the client is not connected, the publish result code is a failure, or the flush does not complete within `timeout`. Lets a caller land a final retained message (for example a graceful state update) before a clean disconnect without a fixed sleep.
+- Ruff formatting and linting: a `[tool.ruff]` config (line-length 100, target py310, the E/W/F/I/B/UP/SIM lint set), a `ruff-pre-commit` hook, and a `lint.yml` CI job running `ruff check` and `ruff format --check`.
+- PyPI version and Ruff badges in the README.
 
 ### Changed
 
-- `MqttClient.publish()` now returns paho's `MQTTMessageInfo` (or `None` when there is no client) instead of discarding it, so a caller can `wait_for_publish(timeout)` for a bounded flush. Backward compatible: callers that ignore the return value are unaffected. (EMQTT-yn2)
-- `MqttClient.stop()` is now bounded and broker-independent, taking a `timeout` (default 2.0s). It runs the potentially-blocking `disconnect()` + `loop_stop()` in a daemon helper thread and joins only for `timeout`, so a dead or unreachable broker can no longer stall the caller (previously `loop_stop()` joined the paho network thread with no timeout). The clean DISCONNECT is best-effort and never depended on; shutdown falls back to the daemon thread plus the LWT. (EMQTT-lk7)
-- Applied an initial Ruff format and lint cleanup across `src` and `tests` (no behavior change): import sorting, PEP 604 unions and `collections.abc.Callable`, `except Exception:` in place of bare `except:`, `contextlib.suppress`, and dropping a mutable default argument. (EMQTT-73n)
+- `MqttClient.publish()` now returns paho's `MQTTMessageInfo` (or `None` when there is no client) instead of discarding it, so a caller can `wait_for_publish(timeout)` for a bounded flush. Backward compatible: callers that ignore the return value are unaffected.
+- `MqttClient.stop()` is now bounded and broker-independent, taking a `timeout` (default 2.0s). It runs the potentially-blocking `disconnect()` + `loop_stop()` in a daemon helper thread and joins only for `timeout`, so a dead or unreachable broker can no longer stall the caller (previously `loop_stop()` joined the paho network thread with no timeout). The clean DISCONNECT is best-effort and never depended on; shutdown falls back to the daemon thread plus the LWT.
+- Applied an initial Ruff format and lint cleanup across `src` and `tests` (no behavior change): import sorting, PEP 604 unions and `collections.abc.Callable`, `except Exception:` in place of bare `except:`, `contextlib.suppress`, and dropping a mutable default argument.
 
 ## [0.1.6] - 2026-06-13
 
 ### Added
 
-- `MqttClient.unsubscribe(sub)`: remove a subscription's local callback and matcher entry (so a later re-publish will not dispatch and the on-reconnect recovery path will not re-subscribe it) and send UNSUBSCRIBE to the broker. Returns `True` when the filter was known, `False` otherwise. (EMQTT-4p1)
+- `MqttClient.unsubscribe(sub)`: remove a subscription's local callback and matcher entry (so a later re-publish will not dispatch and the on-reconnect recovery path will not re-subscribe it) and send UNSUBSCRIBE to the broker. Returns `True` when the filter was known, `False` otherwise.
 - `CONTRIBUTING.md`, linked from the README.
 
 ### Changed
