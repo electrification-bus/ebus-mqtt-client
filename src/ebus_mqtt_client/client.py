@@ -24,6 +24,13 @@ class MqttClient:
     Provides TLS support (secure, insecure, and none), automatic reconnection
     with backoff, subscription recovery on reconnect, topic pattern matching
     via paho's MQTTMatcher, and Last Will and Testament (LWT) support.
+
+    Construction is decoupled from broker availability: ``__init__`` registers
+    the connection target with ``connect_async`` but does not open a socket, so a
+    down or briefly-unavailable broker never makes construction block or raise.
+    The actual connect happens on the network thread started by :meth:`start`,
+    which keeps retrying (with the reconnect backoff) until the broker appears.
+    Use :meth:`is_connected` to observe when the link is up.
     """
 
     def __init__(
@@ -119,7 +126,19 @@ class MqttClient:
                 )
                 self.mqttc.tls_set_context(context)
                 self.mqttc.tls_insecure_set(True)
-        self.mqttc.connect(endpoint, port, keepalive=60)
+        # Resilient connect: use connect_async (which never blocks and never
+        # raises on a down or unreachable broker) instead of the synchronous
+        # connect(). The real TCP/MQTT connect runs on the network thread started
+        # by start() -> loop_start(), which retries the first connection using the
+        # reconnect backoff set above until the broker becomes reachable. This
+        # decouples construction from broker availability: a broker that is briefly
+        # unavailable at construction time (startup, restart, network blip) no
+        # longer yields a silent, never-connecting zombie publisher. Guard the call
+        # so construction stays exception-free even on bad connection parameters.
+        try:
+            self.mqttc.connect_async(endpoint, port, keepalive=60)
+        except Exception:
+            logging.exception(f"reason=mqttClientConnectAsyncException,client={self.client_id}")
 
     @staticmethod
     def _load_client_cert_chain(

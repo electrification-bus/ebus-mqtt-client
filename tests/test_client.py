@@ -46,7 +46,22 @@ class TestMqttClientInit:
     def test_basic_init(self, mock_paho):
         MqttClient(client_id="test", endpoint="localhost", port=1883)
         mock_paho["cls"].assert_called_once_with(client_id="test")
-        mock_paho["instance"].connect.assert_called_once_with("localhost", 1883, keepalive=60)
+        mock_paho["instance"].connect_async.assert_called_once_with("localhost", 1883, keepalive=60)
+        # Construction must not open a socket synchronously.
+        mock_paho["instance"].connect.assert_not_called()
+
+    def test_init_resilient_to_down_broker(self, mock_paho):
+        """A broker that refuses at construction time must not break the constructor.
+
+        The synchronous connect() this replaced raised ConnectionRefusedError on a
+        down broker, leaving callers with a half-built, never-connecting client.
+        connect_async defers the socket to the network loop, but we also guard the
+        call so even an outright failure here cannot propagate out of __init__.
+        """
+        mock_paho["instance"].connect_async.side_effect = ConnectionRefusedError("broker down")
+        # Must not raise.
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        assert client.is_connected() is False
 
     def test_v5_protocol(self, mock_paho):
         MqttClient(client_id="test-v5", endpoint="localhost", port=1883, v5=True)
@@ -319,12 +334,12 @@ class TestMtls:
 class TestFromConfig:
     def test_defaults(self, mock_paho):
         MqttClient.from_config({}, client_id="cfg-test")
-        mock_paho["instance"].connect.assert_called_once_with("127.0.0.1", 1883, keepalive=60)
+        mock_paho["instance"].connect_async.assert_called_once_with("127.0.0.1", 1883, keepalive=60)
 
     def test_custom_host_port(self, mock_paho):
         cfg = {"host": "broker.example.com", "port": 8883}
         MqttClient.from_config(cfg, client_id="cfg-test")
-        mock_paho["instance"].connect.assert_called_once_with(
+        mock_paho["instance"].connect_async.assert_called_once_with(
             "broker.example.com", 8883, keepalive=60
         )
 

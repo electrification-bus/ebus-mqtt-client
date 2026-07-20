@@ -4,9 +4,15 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-20
+
+### Fixed
+
+- Resilient broker connect: construction is no longer coupled to broker availability. `MqttClient.__init__` now calls paho's `connect_async()` (non-blocking, never raising on a down or unreachable broker) instead of the synchronous `connect()`. The real TCP/MQTT connect runs on the network thread started by `start()` -> `loop_start()`, which retries the first connection using the existing reconnect backoff until the broker becomes reachable. Previously a broker that was briefly unavailable at construction time (startup, restart, network blip) made the constructor raise `ConnectionRefusedError`, leaving callers with a silent, never-connecting "zombie" publisher whose every publish was a no-op (`reconnect_delay_set` only governs post-first-connect reconnects, so it never helped a never-connected client). The `connect_async()` call is additionally guarded so construction stays exception-free even on bad connection parameters. Behavioral note for callers: `is_connected()` returns `False` between construction and the first successful connect on the network loop; gate publishes on it (or use `publish_and_flush`, which already checks) if you must not publish before the link is up. A briefly-unavailable broker at startup, restart, or a transient network blip is a normal MQTT condition, so tolerating it at construction time benefits any consumer.
+
 ### Changed
 
-- Adopted the eBus "version single source of truth" convention: `__version__` in `src/ebus_mqtt_client/__init__.py` is now the one place the version is written (and is importable at runtime). `pyproject.toml` resolves it dynamically (`dynamic = ["version"]` + `[tool.setuptools.dynamic]`), the `setup.py` legacy shim reads it by regex instead of a hardcoded literal, and the publish workflow gained a "Verify tag matches package version" guard that fails a release whose `v*` tag disagrees with `__version__`. No version bump (adopting the convention is not a release). A `## Releasing` section documenting the flow was added to the README. (EMQTT-95f)
+- Adopted the eBus "version single source of truth" convention: `__version__` in `src/ebus_mqtt_client/__init__.py` is now the one place the version is written (and is importable at runtime). `pyproject.toml` resolves it dynamically (`dynamic = ["version"]` + `[tool.setuptools.dynamic]`), the `setup.py` legacy shim reads it by regex instead of a hardcoded literal, and the publish workflow gained a "Verify tag matches package version" guard that fails a release whose `v*` tag disagrees with `__version__`. A `## Releasing` section documenting the flow was added to the README. (EMQTT-95f)
 
 ## [0.1.7] - 2026-07-11
 

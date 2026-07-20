@@ -8,6 +8,7 @@ Standalone MQTT client wrapper around [paho-mqtt](https://pypi.org/project/paho-
 ## Features
 
 - TLS support (secure with CA verification, insecure, or plaintext)
+- Resilient connect: construction never blocks or raises on a down broker (`connect_async`); the connection is established and retried on the network loop started by `start()`
 - Automatic reconnection with configurable backoff
 - Subscription recovery on reconnect
 - Topic pattern matching via paho's `MQTTMatcher`
