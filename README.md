@@ -1,9 +1,12 @@
 # ebus-mqtt-client
 
 [![PyPI version](https://img.shields.io/pypi/v/ebus-mqtt-client.svg)](https://pypi.org/project/ebus-mqtt-client/)
+[![Python versions](https://img.shields.io/pypi/pyversions/ebus-mqtt-client.svg)](https://pypi.org/project/ebus-mqtt-client/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/electrification-bus/ebus-mqtt-client/actions/workflows/lint.yml/badge.svg)](https://github.com/electrification-bus/ebus-mqtt-client/actions/workflows/lint.yml)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-Standalone MQTT client wrapper around [paho-mqtt](https://pypi.org/project/paho-mqtt/) v2.
+Standalone MQTT client wrapper around [paho-mqtt](https://pypi.org/project/paho-mqtt/).
 
 ## Features
 
