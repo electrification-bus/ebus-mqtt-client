@@ -45,6 +45,12 @@ version = {attr = "ebus_mqtt_client.__version__"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Ship the PEP 561 marker so consumers' type checkers use this package's inline
+# types. The legacy setup.py shim carries the same package_data for the
+# Yocto/kirkstone build path, where a bare marker is otherwise dropped.
+[tool.setuptools.package-data]
+ebus_mqtt_client = ["py.typed"]
+
 [tool.ruff]
 src = ["src"]
 line-length = 100

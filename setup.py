@@ -26,4 +26,7 @@ setup(
     version=version,
     package_dir={"": "src"},
     packages=["ebus_mqtt_client"],
+    # PEP 561 marker. setuptools 59.5.0 (Yocto kirkstone) drops a bare marker
+    # unless it is listed here; mirrors pyproject package-data.
+    package_data={"ebus_mqtt_client": ["py.typed"]},
 )

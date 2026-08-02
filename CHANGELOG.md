@@ -4,6 +4,12 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-02
+
+### Added
+
+- PEP 561 `py.typed` marker: the package now ships its inline type information, so downstream type checkers resolve `MqttClient` to the concrete class instead of `Any`. The marker is wired into both the modern build (`[tool.setuptools.package-data]`) and the legacy `setup.py` shim (`package_data`, for the Yocto/kirkstone path where a bare marker is otherwise dropped); the built wheel and sdist both contain it.
+
 ## [0.2.0] - 2026-08-02
 
 ### Added
