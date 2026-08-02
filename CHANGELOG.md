@@ -4,6 +4,8 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-02
+
 ### Added
 
 - `on_disconnect_callback` constructor parameter (and matching `from_config` parameter) on `MqttClient`, mirroring the existing `on_connect_callback`. It is invoked from the internal disconnect handler and receives paho's reason code as its single argument, so a caller can react to a dropped or clean connection (for example to mirror connection state into a health readout) instead of polling `is_connected()`. Invoked best-effort: a consumer exception is logged (`reason=onDisconnectCallbackException`) and swallowed so it cannot disrupt paho's network loop. Backward compatible: omitting it preserves current behavior.
