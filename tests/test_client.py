@@ -460,6 +460,32 @@ class TestSubscriptions:
         client._on_connect(mock_paho["instance"], None, {}, 0)
         on_connect.assert_called_once()
 
+    def test_on_disconnect_callback_invoked_with_rc(self, mock_paho):
+        on_disconnect = MagicMock()
+        client = MqttClient(
+            client_id="test",
+            endpoint="localhost",
+            port=1883,
+            on_disconnect_callback=on_disconnect,
+        )
+        client._on_disconnect(mock_paho["instance"], None, 1)
+        on_disconnect.assert_called_once_with(1)
+
+    def test_on_disconnect_callback_exception_swallowed(self, mock_paho, caplog):
+        """A raising consumer callback must not propagate out of the paho loop."""
+        on_disconnect = MagicMock(side_effect=RuntimeError("boom"))
+        client = MqttClient(
+            client_id="test",
+            endpoint="localhost",
+            port=1883,
+            on_disconnect_callback=on_disconnect,
+        )
+        with caplog.at_level("WARNING"):
+            client._on_disconnect(mock_paho["instance"], None, 1)
+        on_disconnect.assert_called_once_with(1)
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("onDisconnectCallbackException" in m for m in warnings)
+
 
 class TestUnsubscribe:
     def test_unsubscribe_removes_callback_and_calls_paho(self, mock_paho):

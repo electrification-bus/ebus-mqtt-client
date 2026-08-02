@@ -53,6 +53,7 @@ class MqttClient:
         v5: bool | None = False,
         lwt: dict | None = None,
         on_connect_callback: Callable | None = None,
+        on_disconnect_callback: Callable | None = None,
     ):
         self.client_id = client_id
         try:
@@ -85,6 +86,7 @@ class MqttClient:
         self.sub_callbacks: dict[str, tuple[Any, int]] = {}
         self.sub_matcher = matcher.MQTTMatcher()
         self.on_connect_callback = on_connect_callback
+        self.on_disconnect_callback = on_disconnect_callback
 
         self.is_running = False
         if username and password:
@@ -225,6 +227,7 @@ class MqttClient:
         callback: Callable[[bytes | bytearray, Any], None] | None = None,
         lwt: dict | None = None,
         on_connect_callback: Callable | None = None,
+        on_disconnect_callback: Callable | None = None,
     ) -> "MqttClient":
         """Create an MqttClient from a configuration dictionary.
 
@@ -246,6 +249,8 @@ class MqttClient:
             callback: Message callback function (optional)
             lwt: Last Will and Testament dict (optional)
             on_connect_callback: Callback invoked on successful connection (optional)
+            on_disconnect_callback: Callback invoked on disconnect, receiving the
+                paho reason code as its single argument (optional)
 
         Returns:
             Configured MqttClient instance
@@ -292,6 +297,7 @@ class MqttClient:
             tls_client_key_password=tls_client_key_password,
             lwt=lwt or {},
             on_connect_callback=on_connect_callback,
+            on_disconnect_callback=on_disconnect_callback,
         )
 
     def is_connected(self):
@@ -342,6 +348,7 @@ class MqttClient:
         self.sub_callbacks.clear()
         self.sub_matcher = matcher.MQTTMatcher()
         self.on_connect_callback = None
+        self.on_disconnect_callback = None
 
     def _shutdown_mqttc(self):
         """Best-effort disconnect + loop_stop; runs in a bounded helper thread."""
@@ -463,6 +470,18 @@ class MqttClient:
             logging.warning(f"reason=mqttBrokerConnectionLost,rc={rc},client={self.client_id}")
         else:
             logging.info(f"reason=mqttBrokerDisconnected,client={self.client_id}")
+        # Invoke supplied on_disconnect_callback if provided, passing the paho
+        # reason code so the caller can distinguish a clean disconnect from a
+        # dropped link. Best-effort: this runs on paho's network thread, so a
+        # raising consumer callback must not kill the loop.
+        if self.on_disconnect_callback:
+            try:
+                self.on_disconnect_callback(rc)
+            except Exception:
+                logging.warning(
+                    f"reason=onDisconnectCallbackException,client={self.client_id}",
+                    exc_info=True,
+                )
 
     def _find_matching_sub(self, topic):
         try:

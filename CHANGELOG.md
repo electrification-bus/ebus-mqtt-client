@@ -6,6 +6,7 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ### Added
 
+- `on_disconnect_callback` constructor parameter (and matching `from_config` parameter) on `MqttClient`, mirroring the existing `on_connect_callback`. It is invoked from the internal disconnect handler and receives paho's reason code as its single argument, so a caller can react to a dropped or clean connection (for example to mirror connection state into a health readout) instead of polling `is_connected()`. Invoked best-effort: a consumer exception is logged (`reason=onDisconnectCallbackException`) and swallowed so it cannot disrupt paho's network loop. Backward compatible: omitting it preserves current behavior.
 - Static type checking with mypy: a `[tool.mypy]` config, `mypy` in the `dev` extra, and a `mypy` job in the `lint.yml` CI workflow. The package now type-checks clean. paho-mqtt is treated as an opaque (untyped, `Any`) dependency via a `paho.*` override (`follow_imports = "skip"`), independent of the installed paho major: 1.x ships no type information, and 2.x ships types for a different callback-API surface than this v1-targeting wrapper uses. This keeps the mypy result stable across `paho-mqtt>=1.5.0`.
 
 ### Fixed
