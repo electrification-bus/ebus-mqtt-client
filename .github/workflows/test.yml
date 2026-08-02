@@ -7,21 +7,41 @@ on:
 
 jobs:
   pytest:
-    name: pytest (py${{ matrix.python-version }})
+    name: pytest (py${{ matrix.python-version }}, paho ${{ matrix.paho }})
     runs-on: ubuntu-latest
     strategy:
-      # Run every version even if one fails, so a single-version break is
-      # visible as exactly that rather than masking the rest.
+      # Run every combination even if one fails, so a single break is visible as
+      # exactly that rather than masking the rest.
       fail-fast: false
       matrix:
         # Mirror pyproject's requires-python (>=3.10) and the classifiers.
         # Tests previously ran only on 3.12 (publish.yml, at release time), so
         # 3.10/3.11/3.13 were unverified despite being declared supported.
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # "latest" is whatever .[dev] resolves (the current paho 2.x); "1.x" is
+        # the paho-mqtt>=1.5.0 floor the package still declares support for. The
+        # wrapper targets paho's VERSION1 callback API, which both majors
+        # provide, but only the un-mocked tests/test_real_paho.py smoke tests
+        # actually cross that boundary (the rest of the suite mocks
+        # paho.mqtt.client.Client).
+        paho: ["latest", "1.x"]
+        # paho-major compatibility is orthogonal to the interpreter, so exercise
+        # 1.x only on the oldest and newest supported Python rather than the full
+        # cross product; every interpreter still runs on the current paho.
+        exclude:
+          - python-version: "3.11"
+            paho: "1.x"
+          - python-version: "3.12"
+            paho: "1.x"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e '.[dev]'
+      # For the 1.x rows, downgrade paho from the 2.x that .[dev] resolved so the
+      # suite actually runs against the older major.
+      - name: Pin paho-mqtt to the 1.x major
+        if: matrix.paho == '1.x'
+        run: pip install 'paho-mqtt>=1.5,<2'
       - run: python -m pytest -q
