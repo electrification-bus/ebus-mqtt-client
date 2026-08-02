@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff>=0.15.0"]
+dev = ["pytest", "ruff>=0.15.0", "mypy>=1.8"]
 
 [project.urls]
 Homepage = "https://ebus.energy"
@@ -67,3 +67,25 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B011"]  # allow assert False in tests
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/ebus_mqtt_client"]
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unused_ignores = true
+warn_unused_configs = true
+
+# Treat the whole paho namespace as opaque (its symbols resolve to Any),
+# independent of which paho major is installed. paho-mqtt 1.x ships no type
+# information, while 2.x ships a py.typed marker but exposes a different
+# callback-API type surface; this wrapper deliberately targets the v1 callback
+# signatures and supports paho>=1.5.0 across the 1.x/2.x boundary. follow_imports
+# = "skip" stops mypy following into paho's (typed 2.x or untyped 1.x) source, so
+# our type-checking result stays stable regardless of the resolved paho version.
+# ignore_missing_imports additionally covers the 1.x "no stubs" case.
+[[tool.mypy.overrides]]
+module = ["paho.*"]
+follow_imports = "skip"
+ignore_missing_imports = true

@@ -38,7 +38,7 @@ class MqttClient:
         client_id: str,
         endpoint: str,
         port: int,
-        callback: Callable[[bytes | bytearray, Any], None] = None,
+        callback: Callable[[bytes | bytearray, Any], None] | None = None,
         username=None,
         password=None,
         use_tls: bool | None = False,
@@ -82,7 +82,7 @@ class MqttClient:
         self.mqttc.on_disconnect = self._on_disconnect
         self.mqttc.on_message = self._on_message
         self.mqttc.user_data_set(callback)
-        self.sub_callbacks = {}
+        self.sub_callbacks: dict[str, tuple[Any, int]] = {}
         self.sub_matcher = matcher.MQTTMatcher()
         self.on_connect_callback = on_connect_callback
 
@@ -178,6 +178,19 @@ class MqttClient:
                 key_path = MqttClient._materialise_pem(key_data, suffix=".key")
                 tmp_paths.append(key_path)
 
+            if cert_path is None:
+                # A client key with no client cert cannot form a certificate
+                # chain (load_cert_chain requires a certfile), so there is
+                # nothing to load. Log and skip rather than call load_cert_chain
+                # with a missing certfile. The client cert is not loaded, so mTLS
+                # is effectively not configured; if the broker requires a client
+                # cert the TLS handshake will fail later. The finally block still
+                # unlinks any key temp file materialised above.
+                logging.warning(
+                    "reason=mqttClientTlsClientKeyWithoutCert,effect=clientCertNotLoaded,mtls=disabled"
+                )
+                return
+
             logging.info(
                 "reason=mqttClientTlsClientCertLoaded,cert=%s,key=%s",
                 "data" if cert_data is not None else cert_path,
@@ -209,7 +222,7 @@ class MqttClient:
         cls,
         mqtt_cfg: dict,
         client_id: str,
-        callback: Callable[[bytes | bytearray, Any], None] = None,
+        callback: Callable[[bytes | bytearray, Any], None] | None = None,
         lwt: dict | None = None,
         on_connect_callback: Callable | None = None,
     ) -> "MqttClient":
@@ -397,7 +410,7 @@ class MqttClient:
                 f"reason=mqttPublishFlushTimeout,client={self.client_id},topic={topic},err={e}"
             )
             return False
-        return msg_info.is_published()
+        return bool(msg_info.is_published())
 
     def subscribe(self, sub: str, param: Any, qos: int = 1):
         if not hasattr(self, "mqttc"):

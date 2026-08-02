@@ -4,6 +4,18 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- Static type checking with mypy: a `[tool.mypy]` config, `mypy` in the `dev` extra, and a `mypy` job in the `lint.yml` CI workflow. The package now type-checks clean. paho-mqtt is treated as an opaque (untyped, `Any`) dependency via a `paho.*` override (`follow_imports = "skip"`), independent of the installed paho major: 1.x ships no type information, and 2.x ships types for a different callback-API surface than this v1-targeting wrapper uses. This keeps the mypy result stable across `paho-mqtt>=1.5.0`.
+
+### Fixed
+
+- mTLS client-certificate loading no longer raises during construction when a client key is supplied without a client certificate. Such a pair cannot form a certificate chain, so it is now logged (`reason=mqttClientTlsClientKeyWithoutCert`) and skipped, instead of calling `load_cert_chain` with a missing `certfile` (which raised `TypeError`). Server-only TLS and normal client cert + key mTLS are unaffected.
+
+### Changed
+
+- Internal type-annotation hygiene (no behavior change): explicit `Optional` on the `callback` parameters of `__init__` and `from_config`, a type annotation on the `sub_callbacks` dict, and `publish_and_flush` now coerces paho's `is_published()` result to `bool` so its declared `-> bool` return type holds.
+
 ## [0.1.8] - 2026-07-20
 
 ### Fixed
