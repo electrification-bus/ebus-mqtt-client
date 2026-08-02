@@ -330,6 +330,28 @@ class TestMtls:
             )
             mock_ctx.load_cert_chain.assert_not_called()
 
+    def test_client_key_without_cert_is_skipped(self, mock_paho, caplog):
+        """A client key with no client cert can't form a chain: skip, don't crash.
+
+        load_cert_chain requires a certfile; calling it with certfile=None raised
+        TypeError during construction. Now the pairing is logged and skipped.
+        """
+        with patch("ebus_mqtt_client.client.ssl.SSLContext") as mock_ctx_cls:
+            mock_ctx = MagicMock()
+            mock_ctx_cls.return_value = mock_ctx
+            with caplog.at_level("WARNING"):
+                MqttClient(
+                    client_id="test",
+                    endpoint="localhost",
+                    port=8883,
+                    use_tls=True,
+                    tls_insecure=True,
+                    tls_client_key="/path/to/client.key",
+                )
+            mock_ctx.load_cert_chain.assert_not_called()
+            warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+            assert any("ClientKeyWithoutCert" in m for m in warnings)
+
 
 class TestFromConfig:
     def test_defaults(self, mock_paho):
