@@ -20,6 +20,7 @@ Standalone MQTT client wrapper around [paho-mqtt](https://pypi.org/project/paho-
 - Factory method for dict-based configuration
 - Bounded, broker-independent shutdown: `stop(timeout=...)` returns promptly even against a dead broker
 - Bounded publish flush: `publish_and_flush(...)` lands a final message before a clean disconnect, no fixed sleep
+- Optional loop-native driving: `AsyncioMqttDriver` runs the network loop on your asyncio event loop instead of a background thread, for hosts that already own a loop
 
 ## Install
 
@@ -119,6 +120,29 @@ cfg = {
 client = MqttClient.from_config(cfg, client_id="my-client")
 client.start()
 ```
+
+### Loop-native driving (asyncio)
+
+By default `start()` runs paho's network loop on a background thread. If your program already owns an asyncio event loop (for example a Home Assistant integration), you can drive the same client on that loop with no extra thread, via the optional `AsyncioMqttDriver`:
+
+```python
+import asyncio
+from ebus_mqtt_client import AsyncioMqttDriver, MqttClient
+
+async def main():
+    client = MqttClient.from_config(cfg, client_id="my-client")
+    driver = client.asyncio_driver()      # or: AsyncioMqttDriver(client, loop=my_loop)
+    await driver.start()                   # instead of client.start()
+    client.subscribe("sensors/#", callback_param)
+    # ... all MQTT I/O now runs on this event loop ...
+    await driver.stop()
+
+asyncio.run(main())
+```
+
+Thread mode (`client.start()`) and the driver are mutually exclusive per client: pick one. The driver module is imported lazily (only when you reference `AsyncioMqttDriver` or call `asyncio_driver()`), so a thread-only consumer never loads the asyncio machinery.
+
+If you inject the client into `ebus_sdk.Controller(mqttc=client)` as a bring-your-own transport, wire `Controller.resync` onto the on-connect callback (`client.on_connect_callback = controller.resync`) so the retained tree re-walks after a reconnect; the SDK does that automatically only for a client it creates itself.
 
 ## Releasing
 
