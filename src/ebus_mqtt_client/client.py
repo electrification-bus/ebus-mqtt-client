@@ -5,10 +5,16 @@ import ssl
 import tempfile
 import threading
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import paho.mqtt.client as mqtt
 import paho.mqtt.matcher as matcher
+
+if TYPE_CHECKING:
+    import asyncio
+    import concurrent.futures
+
+    from ebus_mqtt_client.asyncio_driver import AsyncioMqttDriver
 
 # Default broker configuration
 MQTT_DEFAULT_HOST = "127.0.0.1"
@@ -310,6 +316,26 @@ class MqttClient:
             self.mqttc.loop_forever()
         else:
             self.mqttc.loop_start()
+
+    def asyncio_driver(
+        self,
+        loop: "asyncio.AbstractEventLoop | None" = None,
+        executor: "concurrent.futures.Executor | None" = None,
+    ) -> "AsyncioMqttDriver":
+        """Return an :class:`AsyncioMqttDriver` bound to this client.
+
+        Optional loop-native alternative to :meth:`start`: drives paho's network
+        loop on an asyncio event loop instead of a background thread. Mutually
+        exclusive with :meth:`start` per instance. The driver module is imported
+        lazily here, so a thread-mode consumer never loads it.
+
+        Call this from within a running event loop, or pass ``loop=`` explicitly;
+        with ``loop=None`` the driver resolves the loop via
+        ``asyncio.get_running_loop()`` and raises off-loop.
+        """
+        from ebus_mqtt_client.asyncio_driver import AsyncioMqttDriver
+
+        return AsyncioMqttDriver(self, loop, executor)
 
     def stop(self, timeout: float = 2.0):
         """Stop the client within a small, broker-independent time bound.

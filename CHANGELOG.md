@@ -4,6 +4,10 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- Optional loop-native (asyncio) transport driver `AsyncioMqttDriver` (new `ebus_mqtt_client.asyncio_driver` module) plus a lazy `MqttClient.asyncio_driver()` factory. It pumps an `MqttClient`'s paho network loop on a caller-supplied asyncio event loop (paho socket hooks plus a periodic `loop_misc`) instead of paho's background thread, so a host that already owns an event loop (for example Home Assistant) can run all MQTT I/O on its own loop and inject the client into `ebus_sdk.Controller(mqttc=...)`. Purely additive: no change to `start()` / `stop()` / `from_config()` / `publish` / `subscribe` or the existing callbacks, and thread mode and the driver are mutually exclusive per instance (chosen by the caller). The driver module is not imported when the package is imported (it loads lazily via a module `__getattr__` and the factory), imports only the standard library plus paho, and works across `paho-mqtt>=1.5.0`, so a thread-only consumer (and a constrained/Yocto panel build) never loads it.
+
 ## [0.3.0] - 2026-08-02
 
 ### Added
