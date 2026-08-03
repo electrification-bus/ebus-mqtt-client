@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     # served lazily by __getattr__ below (no import on package import).
     from ebus_mqtt_client.asyncio_driver import AsyncioMqttDriver as AsyncioMqttDriver
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = ["MqttClient", "AUTH_TYPE_USER_PASS", "AsyncioMqttDriver"]
 
