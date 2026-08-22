@@ -12,6 +12,7 @@ Standalone MQTT client wrapper around [paho-mqtt](https://pypi.org/project/paho-
 
 - TLS support (secure with CA verification, insecure, or plaintext)
 - Resilient connect: construction never blocks or raises on a down broker (`connect_async`); the connection is established and retried on the network loop started by `start()`
+- QoS 0 retained publishes issued before the link is up are held (newest value per topic, bounded) and flushed on connect, rather than being discarded by paho and lost
 - Automatic reconnection with configurable backoff
 - Subscription recovery on reconnect
 - Topic pattern matching via paho's `MQTTMatcher`
@@ -63,6 +64,20 @@ client.stop(timeout=2.0)
 ```
 
 `publish()` also returns paho's `MQTTMessageInfo` (or `None` if there is no client), so you can wait for a single message yourself: `client.publish(topic, data).wait_for_publish(1.0)`.
+
+### Publishing before the connection is up
+
+Construction registers the broker with `connect_async` and returns; CONNACK does not arrive until the network loop started by `start()` receives it, so paho refuses anything published in between with `MQTT_ERR_NO_CONN`. That is an expected transient of startup, not a fault, so it no longer logs a warning. What becomes of the message depends on its QoS, because paho only discards some of them:
+
+- **QoS 1 and 2** (`publish()` defaults to QoS 1): paho stores the message in its own out-queue *before* returning `MQTT_ERR_NO_CONN`, keeps it across reconnects, and re-sends it itself once CONNACK arrives. Nothing is held here, because a second copy would put every such message on the wire twice per connect.
+- **QoS 0, retained**: paho keeps nothing, so the message would be lost. It is held here and flushed on connect, before the subscription recovery and before your `on_connect_callback`. The hold keeps the newest value per topic rather than replaying every attempt, because retained state is last-value-wins: a queue that replayed attempts in order could write a stale value on top of a newer one published after the connection came up. It is bounded by `client.pending_limit` (default 512 topics, evicting the oldest) so a client that never connects cannot grow without limit.
+- **QoS 0, not retained**: dropped, with a debug-level line. These are events, and delivering one after an arbitrary delay announces something that was true once.
+
+Any other publish failure still logs a warning, with the paho result code. A publish refused this way still returns paho's `MQTTMessageInfo` with `rc == MQTT_ERR_NO_CONN` whichever branch it took, so a caller that inspects the result sees exactly what paho said. `stop()` discards anything still held.
+
+Two things this does not change, both of them paho's behavior rather than this wrapper's. paho's own out-queue is unbounded unless you set `client.mqttc.max_queued_messages_set(...)`, so `pending_limit` bounds only the QoS 0 hold. And paho replays that queue *after* `on_connect` returns, in the order the publishes were attempted, so at QoS 1 and 2 a value revised while disconnected is re-sent stale-first: if you republish inside `on_connect_callback`, paho's older copy can land after yours. Publish state you care about at QoS 0, or republish after the connection is established.
+
+`publish_and_flush()` is unaffected: it checks `is_connected()` and returns `False` immediately rather than holding, since its whole purpose is to confirm a message reached the broker now.
 
 ### From a config dict
 

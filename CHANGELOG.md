@@ -4,6 +4,16 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+
+- Publishing before the connection is up no longer logs a warning, and a QoS 0 retained message issued then is no longer lost. `__init__` registers the broker with `connect_async`, so CONNACK does not arrive until the network loop started by `start()` receives it, and paho refuses every publish issued in between with `MQTT_ERR_NO_CONN`; `publish()` treated that as a fault and warned on each one. For a caller that announces retained state at startup that is a warning per topic on every start, costing journald budget on embedded targets and reading as a broker or auth failure to anyone debugging one. Such a publish now logs a single debug line recording what became of the message, and every other publish failure still warns, now reporting the paho result code.
+
+  What becomes of the message depends on its QoS, because paho only discards some of them. At QoS 1 and 2 (the `publish()` default is QoS 1) paho stores the message in its own out-queue before returning `MQTT_ERR_NO_CONN`, keeps it across reconnects, and re-sends it once CONNACK arrives, so it is left alone. At QoS 0 paho keeps nothing: a retained message is therefore held here and flushed on connect (before subscription recovery and before `on_connect_callback`, so anything the callback publishes is newer and lands after), and a non-retained one is dropped, because it is an event and delivering it after an arbitrary delay announces something that was true once.
+
+  The hold keeps the newest value per topic rather than replaying every attempt in order: retained state is last-value-wins, so a plain queue could write a stale value on top of a newer one published after the connection came up, leaving a device permanently announcing a state it had already left. It is serialised against the flush with a lock, because the flush runs on paho's network thread and the same overwrite is otherwise reachable by a caller publishing concurrently with it. It is bounded by the new per-instance `pending_limit` (default 512 topics, evicting the oldest), with an overflow reported once and then sampled rather than once per drop. A publish refused again mid-flush (the link dropped partway through the drain) goes back into the hold rather than being lost. `stop()` discards anything still held.
+
+  `publish()` still returns paho's `MQTTMessageInfo` unchanged, so a publish refused this way reports `rc == MQTT_ERR_NO_CONN` to the caller whichever branch it took. `publish_and_flush()` was never affected (it checks `is_connected()` and returns `False` early) and keeps its warning: unlike the startup transient, its callers use it to confirm a final message reached the broker, where not-connected genuinely means the message did not land.
+
 ## [0.4.0] - 2026-08-03
 
 ### Added
