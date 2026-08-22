@@ -4,6 +4,8 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-21
+
 ### Fixed
 
 - Publishing before the connection is up no longer logs a warning, and a QoS 0 retained message issued then is no longer lost. `__init__` registers the broker with `connect_async`, so CONNACK does not arrive until the network loop started by `start()` receives it, and paho refuses every publish issued in between with `MQTT_ERR_NO_CONN`; `publish()` treated that as a fault and warned on each one. For a caller that announces retained state at startup that is a warning per topic on every start, costing journald budget on embedded targets and reading as a broker or auth failure to anyone debugging one. Such a publish now logs a single debug line recording what became of the message, and every other publish failure still warns, now reporting the paho result code.
