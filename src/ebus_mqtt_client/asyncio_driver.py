@@ -118,6 +118,7 @@ class AsyncioMqttDriver:
         self._paho.on_socket_unregister_write = self._on_socket_unregister_write
 
         self._client.is_running = True
+        self._client._resume_hold()
         try:
             await self._connect()
         except Exception as err:  # noqa: BLE001 - any first-connect failure retries in the loop
@@ -246,3 +247,5 @@ class AsyncioMqttDriver:
             with contextlib.suppress(Exception):
                 self._sock.close()
             self._sock = None
+        # As MqttClient.stop() does: drop the hold, and hold nothing until restart.
+        self._client._discard_hold()

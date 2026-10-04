@@ -1,10 +1,14 @@
-"""QoS 0 retained publishes issued before the link is up are held, not dropped.
+"""Publishes issued while the link is down are held by the wrapper, not dropped
+and not left to paho.
 
 `__init__` uses `connect_async`, so CONNACK does not arrive until the network
 loop started by `start()` gets it, and paho refuses every publish issued in
 between with `MQTT_ERR_NO_CONN`. Those publishes used to be logged as failures,
 and the QoS 0 ones were lost outright, which for a caller that announces
-retained state at startup is the whole announcement, on every start.
+retained state at startup is the whole announcement, on every start. The QoS 1
+and 2 ones were left to paho, which replays them on CONNACK in an uncapped burst
+after `on_connect`, overwriting newer values and, at QoS 2, exceeding the
+broker's receive quota (GH #20).
 
 Which QoS is load-bearing here, so it is stated explicitly in every test rather
 than left to the `publish()` default.
@@ -12,6 +16,8 @@ than left to the `publish()` default.
 
 import logging
 import threading
+from collections import OrderedDict
+from types import SimpleNamespace
 
 import paho.mqtt.client as mqtt
 import pytest
@@ -32,15 +38,24 @@ class FakePaho:
     nothing, so the message is gone. At QoS 1 and 2 it has already stored the
     message in `_out_messages` when it returns `MQTT_ERR_NO_CONN`, and re-sends
     it from `_handle_connack` once CONNACK arrives, after `on_connect` returns.
-    A fake that discarded at every QoS would let these tests certify a guarantee
-    the library does not have, and would hide a double publish at QoS 1 and 2.
+    The wrapper never hands paho a publish while the link is not ready, but one
+    racing a link drop still lands in that queue; `refuse_sends` models that
+    window. A fake that discarded at every QoS would hide it.
     """
 
     def __init__(self):
         self.connected = False
         self.published: list[tuple[str, str, int, bool]] = []  # in wire order
-        self.queued: list[tuple[str, str, int, bool]] = []  # paho's own out-queue
+        self._out_messages: OrderedDict[int, SimpleNamespace] = OrderedDict()
+        self._mid = 0
+        # Report connected but refuse to send: the window after paho has noticed
+        # the drop (socket closed) and before on_disconnect reaches the wrapper.
+        self.refuse_sends = False
         self.subscribed: list[tuple[str, int]] = []
+
+    @property
+    def queued(self):
+        return [(m.topic, m.payload, m.qos, m.retain) for m in self._out_messages.values()]
 
     # -- the surface MqttClient touches at construction and shutdown --------
     def will_set(self, **kw):
@@ -76,11 +91,14 @@ class FakePaho:
 
     # -- the bit under test -------------------------------------------------
     def publish(self, topic, data, qos, retain):
-        info = type("Info", (), {})()
-        if not self.connected:
+        self._mid += 1
+        info = mqtt.MQTTMessageInfo(self._mid)
+        if not self.connected or self.refuse_sends:
             info.rc = mqtt.MQTT_ERR_NO_CONN
             if qos > 0:
-                self.queued.append((topic, data, qos, retain))
+                self._out_messages[self._mid] = SimpleNamespace(
+                    topic=topic, payload=data, qos=qos, retain=retain
+                )
             return info
         self.published.append((topic, data, qos, retain))
         info.rc = mqtt.MQTT_ERR_SUCCESS
@@ -89,7 +107,7 @@ class FakePaho:
     def drain_queue(self):
         """What `_handle_connack` does once `on_connect` has returned."""
         self.published.extend(self.queued)
-        self.queued.clear()
+        self._out_messages.clear()
 
 
 @pytest.fixture
@@ -104,8 +122,22 @@ def client(monkeypatch):
 def connect(client):
     """Simulate CONNACK arriving once the network loop starts."""
     client._fake.connected = True
-    client._on_connect(client._fake, None, 0, 0)  # paho dispatches on_connect,
+    client._fake.refuse_sends = False
+    client._on_connect(client._fake, None, {"session present": 0}, 0)  # paho dispatches on_connect,
     client._fake.drain_queue()  # then re-sends its own out-queue
+
+
+def disconnect_while_another_thread_holds_the_publish_lock(client):
+    """Run on_disconnect on a worker while this thread holds _pending_lock, as a
+    thread inside paho's publish would. True if it finished rather than
+    deadlocking on that lock."""
+    worker = threading.Thread(target=client._on_disconnect, args=(client._fake, None, 1))
+    with client._pending_lock:
+        worker.start()
+        worker.join(2.0)
+        finished = not worker.is_alive()
+    worker.join(5.0)
+    return finished
 
 
 def topics(client):
@@ -144,7 +176,7 @@ class TestHeldUntilConnected:
     def test_the_flush_precedes_subscriptions_and_the_connect_callback(self, client):
         # What was published while disconnected describes state that already
         # exists, so it belongs on the broker before anything reacts to being
-        # connected. Anything the callback publishes is newer and lands after.
+        # connected, so it is published before the callback runs.
         fake = client._fake
         order = []
         client.on_connect_callback = lambda: order.append("callback")
@@ -166,11 +198,12 @@ class TestHeldUntilConnected:
 
         assert order == ["flush", "subscribe", "callback"]
 
-    def test_publish_returns_pahos_message_info_even_when_held(self, client):
+    def test_a_held_publish_returns_a_message_info_with_no_conn(self, client):
         info = client.publish("a/b", "v", qos=0, retain=True)
         assert info is not None
         assert info.rc == mqtt.MQTT_ERR_NO_CONN
         assert "a/b" in client._pending
+        assert client._fake.queued == [] and client._fake.published == [], "paho not called"
 
     def test_no_client_still_returns_none_and_holds_nothing(self, client):
         del client.mqttc
@@ -178,22 +211,22 @@ class TestHeldUntilConnected:
         assert not client._pending
 
 
-class TestPahoQueuesTheHigherQoSItself:
-    """Why the hold is scoped to QoS 0 rather than to every retained publish.
+class TestHigherQoSIsHeldNotLeftToPaho:
+    """Why the hold covers QoS 1 and 2 rather than leaving them to paho.
 
     paho stores a QoS 1 or 2 message in `_out_messages` before it returns
-    `MQTT_ERR_NO_CONN`, and re-sends it itself once CONNACK arrives. Holding one
-    here as well would put a second, identical copy of every message on the wire
-    on every connect: at `PENDING_LIMIT` topics that is 1024 retained PUBLISHes
-    per connect instead of 512, on exactly the constrained targets this exists
-    to be quiet on.
+    `MQTT_ERR_NO_CONN`, then on CONNACK replays the whole queue in one burst that
+    ignores `max_inflight_messages`, after `on_connect` has published the current
+    state, so an older value can overwrite it. At QoS 2 the burst can also
+    exceed the broker's receive quota, and mosquitto acknowledges the excess
+    from an MQTT 3.1.1 client and discards it (GH #20).
     """
 
     @pytest.mark.parametrize("qos", [1, 2])
-    def test_a_higher_qos_retained_publish_is_not_held(self, client, qos):
+    def test_a_higher_qos_retained_publish_is_held_not_queued_by_paho(self, client, qos):
         client.publish("a/state", "ready", qos=qos, retain=True)
-        assert not client._pending
-        assert client._fake.queued == [("a/state", "ready", qos, True)]
+        assert "a/state" in client._pending
+        assert client._fake.queued == []
 
     @pytest.mark.parametrize("qos", [1, 2])
     def test_it_reaches_the_broker_exactly_once(self, client, qos):
@@ -201,18 +234,114 @@ class TestPahoQueuesTheHigherQoSItself:
         connect(client)
         assert client._fake.published == [("a/state", "ready", qos, True)]
 
-    def test_the_default_qos_is_one_so_the_default_path_is_pahos(self, client):
-        # Guards the scoping against a change of default: if publish() ever
-        # defaulted to QoS 0, every existing caller would silently move onto
-        # the hold, and this test is where that shows up.
+    def test_the_default_qos_is_held_too(self, client):
         client.publish("a/state", "ready", retain=True)
-        assert not client._pending
+        assert "a/state" in client._pending
+
+    def test_a_revised_value_lands_once_newest_first_in_line(self, client):
+        client.publish("a/state", "init", qos=2, retain=True)
+        client.publish("a/state", "ready", qos=2, retain=True)
+        connect(client)
+        assert client._fake.published == [("a/state", "ready", 2, True)]
+
+    def test_held_state_lands_before_what_the_connect_callback_publishes(self, client):
+        # paho's own replay runs after on_connect, so a stale queued copy would
+        # land on top of the fresh value the callback republished.
+        client.publish("a/state", "init", qos=2, retain=True)
+        client.on_connect_callback = lambda: client.publish("a/state", "ready", qos=2, retain=True)
+        connect(client)
+        assert payloads(client) == ["init", "ready"]
+
+    @pytest.mark.parametrize("qos", [1, 2])
+    def test_higher_qos_events_are_held_in_order_and_not_merged(self, client, qos):
+        client.publish("a/event", "1", qos=qos)
+        client.publish("a/other", "x", qos=qos)
+        client.publish("a/event", "2", qos=qos)
+        connect(client)
+        assert client._fake.published == [
+            ("a/event", "1", qos, False),
+            ("a/other", "x", qos, False),
+            ("a/event", "2", qos, False),
+        ]
 
     def test_a_mixed_announcement_lands_once_per_topic(self, client):
         client.publish("a/state", "ready", qos=0, retain=True)
         client.publish("a/config", "{}", qos=1, retain=True)
         connect(client)
-        assert sorted(topics(client)) == ["a/config", "a/state"]
+        assert topics(client) == ["a/state", "a/config"]
+
+
+class TestPublishesBetweenConnackAndTheFlush:
+    """paho reports connected at CONNACK, before on_connect runs the flush."""
+
+    def connack_then(self, client, publish_in_gap):
+        fake = client._fake
+        fake.connected = True  # paho's state flips here ...
+        publish_in_gap()  # ... an app thread publishes ...
+        client._on_connect(fake, None, {"session present": 0}, 0)  # ... then the flush
+        fake.drain_queue()
+
+    def test_a_newer_value_is_not_overwritten_by_the_older_held_one(self, client):
+        client.publish("a/state", "old", qos=1, retain=True)
+        self.connack_then(client, lambda: client.publish("a/state", "new", qos=1, retain=True))
+        assert payloads(client) == ["new"]
+
+    def test_an_event_is_delivered_once_in_order(self, client):
+        client.publish("a/event", "1", qos=1)
+        self.connack_then(client, lambda: client.publish("a/event", "2", qos=1))
+        assert payloads(client) == ["1", "2"]
+
+    def test_publish_and_flush_refuses_rather_than_overtaking_the_hold(self, client):
+        client.publish("a/state", "ready", qos=1, retain=True)
+        result = []
+        self.connack_then(
+            client,
+            lambda: result.append(client.publish_and_flush("a/state", "disconnected", qos=1)),
+        )
+        assert result == [False]
+        assert payloads(client) == ["ready"]
+
+    def test_publish_and_flush_during_the_flush_lands_after_it(self, client):
+        # The flush marks the link ready before sending the held entries, so a
+        # publish_and_flush arriving mid-flush must wait for the flush rather
+        # than reach paho ahead of the older held value.
+        client.publish("a/state", "old", qos=1, retain=True)
+        client.publish("a/other", "x", qos=1, retain=True)
+        fake = client._fake
+        real = fake.publish
+        racer = []
+
+        def first_send_starts_a_racer(*a):
+            if not racer:
+                t = threading.Thread(
+                    target=lambda: client.publish_and_flush(
+                        "a/state", "new", qos=1, retain=True, timeout=0.1
+                    )
+                )
+                racer.append(t)
+                t.start()
+                t.join(RACE_WINDOW)
+            return real(*a)
+
+        fake.publish = first_send_starts_a_racer
+        connect(client)
+        racer[0].join(5)
+        assert payloads(client) == ["old", "x", "new"]
+
+
+class TestDisconnectCallback:
+    def test_publishing_from_on_disconnect_callback_holds_without_paho(self, client):
+        # on_disconnect can run while paho holds its own out-queue mutex, so a
+        # publish from it must not need _pending_lock or reach paho.
+        connect(client)
+        client.on_disconnect_callback = lambda rc: client.publish(
+            "a/state", "lost", qos=1, retain=True
+        )
+        client._fake.connected = False
+        assert disconnect_while_another_thread_holds_the_publish_lock(client)
+        assert "a/state" in client._pending
+        connect(client)
+        assert payloads(client) == ["lost"]
 
 
 class TestStaleValuesCannotWin:
@@ -283,8 +412,9 @@ class TestEventsAreNotReplayed:
         [
             (0, True, "held"),
             (0, False, "dropped"),
-            (1, True, "queuedByPaho"),
-            (1, False, "queuedByPaho"),
+            (1, True, "held"),
+            (1, False, "held"),
+            (2, True, "held"),
         ],
     )
     def test_publishing_before_connect_does_not_warn(
@@ -378,3 +508,118 @@ class TestFailuresStillReported:
         assert "mqttPublishFail" in caplog.text
         assert f"rc={mqtt.MQTT_ERR_QUEUE_SIZE}" in caplog.text
         assert not client._pending, "a real failure must not be silently held"
+
+
+class TestInvalidPublishesRaiseToTheCaller:
+    """A held publish reaches paho only in the flush, on paho's network thread,
+    where an exception ends the loop. paho validates before it checks the
+    connection, so these raised to the caller when they went to paho first."""
+
+    @pytest.mark.parametrize(
+        ("topic", "data", "qos", "exc"),
+        [
+            ("a/+/b", "v", 1, ValueError),
+            ("a/#", "v", 1, ValueError),
+            ("", "v", 1, ValueError),
+            ("a/b", "v", 3, ValueError),
+            ("a/b", {"not": "encodable"}, 1, TypeError),
+        ],
+    )
+    def test_raised_while_the_link_is_down(self, client, topic, data, qos, exc):
+        with pytest.raises(exc):
+            client.publish(topic, data, qos=qos, retain=True)
+        assert not client._pending
+
+    def test_one_bad_entry_cannot_kill_the_flush(self, client):
+        # Defense in depth: paho rejecting something validation let through
+        # must not end the loop or drop the rest of the hold.
+        client.publish("a/bad", "v", qos=1, retain=True)
+        client.publish("a/good", "v", qos=1, retain=True)
+        fake = client._fake
+        real = fake.publish
+
+        def reject_bad(topic, *a):
+            if topic == "a/bad":
+                raise ValueError("rejected")
+            return real(topic, *a)
+
+        fake.publish = reject_bad
+        connect(client)
+        assert topics(client) == ["a/good"]
+        assert client._link_ready
+
+
+class TestPublishAndFlushFromTheDisconnectCallback:
+    def test_returns_false_without_needing_the_publish_lock(self, client):
+        connect(client)
+        result = []
+        client.on_disconnect_callback = lambda rc: result.append(
+            client.publish_and_flush("a/state", "lost", qos=1, retain=True, timeout=0.1)
+        )
+        client._fake.connected = False
+        assert disconnect_while_another_thread_holds_the_publish_lock(client)
+        assert result == [False]
+
+    def test_mqttv5_disconnect_with_properties_marks_the_link_down(self, client):
+        # paho passes a v5 on_disconnect a trailing properties argument; a
+        # TypeError there would leave the link marked ready after a drop.
+        connect(client)
+        client._fake.connected = False
+        client._on_disconnect(client._fake, None, 1, None)
+        assert not client._link_ready
+        client.publish("a/state", "v", qos=1, retain=True)
+        assert "a/state" in client._pending
+
+
+class TestStopped:
+    def test_nothing_is_held_after_stop(self, client):
+        client.stop(timeout=0.1)
+        info = client.publish("a/state", "ready", qos=1, retain=True)
+        assert info.rc == mqtt.MQTT_ERR_NO_CONN
+        assert not client._pending
+        with pytest.raises(RuntimeError):
+            info.wait_for_publish(1)
+
+    def test_start_holds_again(self, client):
+        client.stop(timeout=0.1)
+        client.start()
+        client.publish("a/state", "ready", qos=1, retain=True)
+        assert "a/state" in client._pending
+
+
+class TestValidationMatchesPaho:
+    def test_a_bytes_topic_raises_as_paho_does(self, client):
+        with pytest.raises(AttributeError):
+            client.publish(b"a/b", "v", qos=1, retain=True)
+
+    def test_an_empty_topic_is_allowed_under_v5_only(self, monkeypatch):
+        fake = FakePaho()
+        monkeypatch.setattr("ebus_mqtt_client.client.mqtt.Client", lambda *a, **kw: fake)
+        v5 = MqttClient(client_id="v5", endpoint="127.0.0.1", port=1883, v5=True)
+        v5.publish("", "v", qos=1, retain=True)
+        v3 = MqttClient(client_id="v3", endpoint="127.0.0.1", port=1883)
+        with pytest.raises(ValueError):
+            v3.publish("", "v", qos=1, retain=True)
+
+
+class TestPahosOwnQueue:
+    def test_a_qos12_publish_refused_in_the_drop_window_is_left_to_paho(self, client):
+        # Between the link dropping and on_disconnect, paho refuses a publish
+        # but stores it at QoS 1 and 2 and resends it itself; holding it too
+        # would send it twice.
+        connect(client)
+        client._fake.refuse_sends = True
+        info = client.publish("a/state", "v", qos=1, retain=True)
+        assert info.rc == mqtt.MQTT_ERR_NO_CONN
+        assert not client._pending
+        assert client._fake.queued == [("a/state", "v", 1, True)]
+        client._fake.connected = False
+        client._on_disconnect(client._fake, None, 1)
+        connect(client)
+        assert payloads(client) == ["v"]
+
+    def test_a_qos0_retained_publish_refused_in_the_drop_window_is_held(self, client):
+        connect(client)
+        client._fake.refuse_sends = True
+        client.publish("a/state", "v", qos=0, retain=True)
+        assert "a/state" in client._pending

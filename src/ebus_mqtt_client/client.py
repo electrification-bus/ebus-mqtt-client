@@ -24,10 +24,42 @@ MQTT_DEFAULT_PORT = 1883
 # Authentication types
 AUTH_TYPE_USER_PASS = "USER_PASS"
 
-# How many not-yet-connected QoS 0 retained topics to hold (MqttClient.publish).
+# How many not-yet-connected publishes to hold (MqttClient.publish): one per
+# retained topic, one per non-retained QoS 1/2 event.
 # Sized to cover a whole device tree, which is the realistic worst case, while
 # still being a bound: a client that never connects must not grow forever.
 PENDING_LIMIT = 512
+
+
+def _validate_publish(topic: Any, data: Any, qos: Any, v5: bool) -> None:
+    """Raise what paho's publish() raises for arguments it would reject.
+
+    A publish held while the link is down never reaches paho until the flush,
+    which runs on paho's network thread, where an exception would end the loop.
+    Checking here keeps the error with the caller, as paho itself does. Mirrors
+    paho 2.1.0 ``Client.publish`` and ``_encode_payload`` (1.6.1 is the same).
+    """
+    if not v5 and (topic is None or len(topic) == 0):
+        raise ValueError("Invalid topic.")
+    topic_bytes = topic.encode("utf-8")
+    if b"+" in topic_bytes or b"#" in topic_bytes:
+        raise ValueError("Publish topic cannot contain wildcards.")
+    if len(topic_bytes) > 65535:
+        raise ValueError("Publish topic is too long.")
+    if qos < 0 or qos > 2:
+        raise ValueError("Invalid QoS level.")
+    if isinstance(data, str):
+        size = len(data.encode("utf-8"))
+    elif isinstance(data, (int, float)):
+        size = len(str(data))
+    elif data is None:
+        size = 0
+    elif isinstance(data, (bytes, bytearray)):
+        size = len(data)
+    else:
+        raise TypeError("payload must be a string, bytearray, int, float or None.")
+    if size > 268435455:
+        raise ValueError("Payload too large.")
 
 
 class MqttClient:
@@ -44,10 +76,11 @@ class MqttClient:
     which keeps retrying (with the reconnect backoff) until the broker appears.
     Use :meth:`is_connected` to observe when the link is up.
 
-    Because of that deferral, a QoS 0 retained publish issued before the link is
-    up is held (newest value per topic, bounded) and flushed on connect rather
-    than dropped. At QoS 1 and 2 paho queues and re-sends the message itself, so
-    nothing is held; see :meth:`publish`.
+    Because of that deferral, a retained publish issued while the link is down is
+    held (newest value per topic, bounded) and flushed on connect, ahead of
+    ``on_connect_callback``, rather than dropped or left to paho's replay. A
+    non-retained one is held in order at QoS 1 and 2 and dropped at QoS 0; see
+    :meth:`publish`.
     """
 
     def __init__(
@@ -73,6 +106,7 @@ class MqttClient:
         on_disconnect_callback: Callable | None = None,
     ):
         self.client_id = client_id
+        self._v5 = bool(v5)
         try:
             if v5:
                 self.mqttc = mqtt.Client(client_id=self.client_id, protocol=mqtt.MQTTv5)
@@ -106,13 +140,32 @@ class MqttClient:
         self.on_disconnect_callback = on_disconnect_callback
 
         self.is_running = False
-        # QoS 0 retained publishes issued while the link is down, newest value
-        # per topic, plus the lock that serialises them against the flush on the
-        # network thread. See publish() for why the hold exists, and why it is
-        # scoped to the one QoS paho does not queue for itself.
-        self._pending: OrderedDict[str, tuple[str, int, bool]] = OrderedDict()
+        # Publishes issued while the link is down. A retained publish is keyed by
+        # its topic (newest value wins); a non-retained one by a unique
+        # ("event", n) key, so events keep their order and are never merged.
+        # Values are (topic, data, qos, retain). See publish().
+        self._pending: OrderedDict[str | tuple[str, int], tuple[str, Any, int, bool]] = (
+            OrderedDict()
+        )
+        self._pending_seq = 0
         self._pending_dropped = 0
+        # How far entries put back in front of the hold by an interrupted flush
+        # widen pending_limit until the next flush.
+        self._pending_extra = 0
+        # Set by stop(), cleared by start(): nothing is held while stopped.
+        self._stopped = False
+        # Whether publishes may go to paho: set when the flush on connect takes
+        # the hold (under _pending_lock, so later publishes queue behind it),
+        # cleared on disconnect. Distinct from paho's is_connected(), which turns
+        # true at CONNACK, before the flush.
+        self._link_ready = False
+        # Lock order, never reversed: _pending_lock, then _hold_lock.
+        # _pending_lock serialises every publish that reaches paho against the
+        # flush. _hold_lock guards the hold and _link_ready and is never held
+        # across a call into paho, so the not-ready path can take it from inside
+        # a paho callback, which paho may run while holding its own locks.
         self._pending_lock = threading.Lock()
+        self._hold_lock = threading.Lock()
         # Per-instance so a consumer can tune the bound without subclassing.
         self.pending_limit = PENDING_LIMIT
         if username and password:
@@ -332,6 +385,7 @@ class MqttClient:
 
     def start(self, blocking=False):
         self.is_running = True
+        self._resume_hold()
         if blocking:
             self.mqttc.loop_forever()
         else:
@@ -393,14 +447,31 @@ class MqttClient:
         # Drop anything still held: a stopped client has no connect left to
         # flush it on, and replaying it if the caller starts the client again
         # would resurrect state from before the stop.
-        with self._pending_lock:
-            self._pending.clear()
-            self._pending_dropped = 0
+        self._discard_hold()
         # Release subscription callbacks and matcher to free memory
         self.sub_callbacks.clear()
         self.sub_matcher = matcher.MQTTMatcher()
         self.on_connect_callback = None
         self.on_disconnect_callback = None
+
+    def _discard_hold(self) -> None:
+        """Drop everything held and hold nothing until :meth:`_resume_hold`.
+
+        Called by both stop paths (this client's and the asyncio driver's): a
+        stopped client has no connect left to flush on, and replaying held
+        state if it is started again would resurrect state from before the stop.
+        """
+        with self._hold_lock:
+            self._link_ready = False
+            self._stopped = True
+            self._pending.clear()
+            self._pending_dropped = 0
+            self._pending_extra = 0
+
+    def _resume_hold(self) -> None:
+        """Hold publishes again while the link is down (both start paths)."""
+        with self._hold_lock:
+            self._stopped = False
 
     def _shutdown_mqttc(self):
         """Best-effort disconnect + loop_stop; runs in a bounded helper thread."""
@@ -414,132 +485,219 @@ class MqttClient:
     def publish(
         self, topic: str, data: str, qos: int = 1, retain: bool = False
     ) -> mqtt.MQTTMessageInfo | None:
-        """Publish a message and return paho's MQTTMessageInfo (or None if no client).
+        """Publish a message and return an MQTTMessageInfo (or None if no client).
 
         Returning the message info lets a caller optionally wait for the message
         to be flushed to the broker via ``msg_info.wait_for_publish(timeout)``.
         See :meth:`publish_and_flush` for a bounded convenience wrapper.
 
-        Publishing before the link is up is an expected condition here, not a
+        Publishing while the link is down is an expected condition here, not a
         fault: ``__init__`` deliberately uses ``connect_async``, so CONNACK does
-        not arrive until the network loop started by :meth:`start` gets it, and
-        paho refuses any publish issued in between with ``MQTT_ERR_NO_CONN``.
-        Such a publish is therefore never logged as a failure. What happens to
-        the message then depends on its QoS, because paho only discards some of
-        them:
+        not arrive until the network loop started by :meth:`start` gets it. The
+        link counts as down from the disconnect until the flush on the next
+        connect takes the hold, so a publish issued after CONNACK but before the
+        flush joins the hold behind the older values rather than overtaking
+        them. Such a publish is never handed to paho and never logged as a
+        failure. It is held here (see :meth:`_hold`) and flushed on connect,
+        before the subscription recovery and before ``on_connect_callback``:
 
-        * at **QoS 0** paho drops a refused message outright, so a **retained**
-          one is held here (see :meth:`_hold`) and flushed on connect: retained
-          messages are state, and state that was true before the link came up is
-          still true after it. A non-retained one is dropped, because it is an
-          event, and delivering it after an arbitrary delay announces something
+        * a **retained** publish, at any QoS, is held newest-value-per-topic.
+          Retained messages are state, and state that was true before the link
+          came up is still true after it, but only the latest value of it.
+        * a **non-retained** publish at **QoS 1 or 2** is held in order, one
+          entry per publish, so every event is delivered once.
+        * a **non-retained** publish at **QoS 0** is dropped: delivering a
+          fire-and-forget event after an arbitrary delay announces something
           that was true once, which is worse than not delivering it.
-        * at **QoS 1 and 2** paho puts the message in its own out-queue before
-          the refusal (``self._out_messages``, kept across reconnects) and
-          re-sends it itself once CONNACK arrives, so nothing is held here.
-          Holding it too would publish every such message twice per connect.
 
-        Every other failure still warns, and reports which result code. The
-        returned message info is paho's own and is passed back unchanged, so a
-        publish refused this way still reports ``rc == MQTT_ERR_NO_CONN`` to the
-        caller whether it was held, queued by paho, or dropped.
+        paho is kept out of this because of what it does with a QoS 1 or 2
+        publish it refuses: it stores it and, on CONNACK, replays its whole queue
+        in one burst that ignores ``max_inflight_messages`` and lands after
+        anything ``on_connect`` published, so a stale value can overwrite a fresh
+        one. At QoS 2 the burst can also exceed the broker's receive quota
+        (mosquitto's ``max_inflight_messages``, default 20); mosquitto
+        acknowledges the excess from an MQTT 3.1.1 client and discards it
+        (GH #20). paho still replays what it accepted on a live link and had not
+        finished delivering when the link dropped, and a QoS 1 or 2 publish it
+        refuses in the moment between the drop and ``on_disconnect``.
+
+        Arguments paho would reject (a non-``str`` or wildcard topic, an empty
+        topic under MQTT 3.1.1, a QoS outside 0-2, a payload paho cannot encode)
+        raise here, with the exception paho itself raises, whether or not the
+        publish is held. Every other failure still warns, and reports which
+        result code. A held publish returns an ``MQTTMessageInfo`` with
+        ``rc == MQTT_ERR_NO_CONN``, as paho reports a refused publish; the
+        message is published afresh when the hold is flushed, so that info never
+        completes.
         """
         if not hasattr(self, "mqttc"):
             logging.error(f"reason=mqttPublishNoClient,client={self.client_id},topic={topic}")
             return None
+        _validate_publish(topic, data, qos, self._v5)
+        # While the link is down, hold without touching paho or _pending_lock.
+        # This is the path a publish from on_disconnect_callback takes, which
+        # can run while paho holds its own out-queue mutex; taking _pending_lock
+        # there could deadlock against a thread already inside paho's publish.
+        with self._hold_lock:
+            if not self._link_ready:
+                return self._hold_or_drop(topic, data, qos, retain)
         # Held under the same lock as the flush so a publish issued while a
         # flush is in flight cannot be overtaken by the older value being
         # flushed for that topic; see _flush_pending.
         with self._pending_lock:
-            return self._publish_locked(topic, data, qos, retain)
-
-    def _publish_locked(
-        self, topic: str, data: str, qos: int, retain: bool
-    ) -> mqtt.MQTTMessageInfo:
-        """Publish once, holding or reporting the result. Caller holds the lock."""
-        msg_info = self.mqttc.publish(topic, data, qos, retain)
-        if msg_info.rc == mqtt.MQTT_ERR_SUCCESS:
-            return msg_info
-
+            msg_info = self._send(topic, data, qos, retain)
+            if msg_info is None or (msg_info.rc == mqtt.MQTT_ERR_NO_CONN and qos == 0):
+                with self._hold_lock:
+                    return self._hold_or_drop(topic, data, qos, retain)
         if msg_info.rc == mqtt.MQTT_ERR_NO_CONN:
-            # Hold only what paho actually loses. At QoS 0 it calls _send_publish
-            # directly and keeps nothing, so a refused message is gone. At QoS 1
-            # and 2 it has already stored the message in its own out-queue by the
-            # time it returns this code ("remove from inflight messages so it
-            # will be send after a connection is made") and re-sends it from
-            # _handle_connack, so holding it here would put a second, identical
-            # copy of every message on the wire on every connect. Verified
-            # identical in paho 1.6.1 and 2.1.0.
-            if retain and qos == 0:
-                self._hold(topic, data, qos, retain)
-                disposition = "held"
-            elif qos > 0:
-                disposition = "queuedByPaho"
-            else:
-                disposition = "dropped"
+            # The link dropped and paho noticed before on_disconnect told us. At
+            # QoS 1 and 2 paho has stored the message and will resend it itself.
             logging.debug(
                 f"reason=mqttPublishNotConnected,client={self.client_id},"
-                f"topic={topic},qos={qos},disposition={disposition}"
+                f"topic={topic},qos={qos},disposition=queuedByPaho"
             )
-            return msg_info
-
-        logging.warning(
-            f"reason=mqttPublishFail,client={self.client_id},topic={topic},rc={msg_info.rc}"
-        )
+        elif msg_info.rc != mqtt.MQTT_ERR_SUCCESS:
+            logging.warning(
+                f"reason=mqttPublishFail,client={self.client_id},topic={topic},rc={msg_info.rc}"
+            )
         return msg_info
 
-    def _hold(self, topic: str, data: str, qos: int, retain: bool) -> None:
-        """Keep a QoS 0 retained publish until the link is up. Caller holds the lock.
+    def _send(self, topic: str, data: Any, qos: int, retain: bool) -> mqtt.MQTTMessageInfo | None:
+        """Hand one publish to paho if the link is ready; never holds anything.
 
-        Keyed by topic, keeping the newest value, which is not an optimisation:
-        retained state is last-value-wins, so a queue that replayed every
-        attempt in order could write a stale value on top of a newer one
-        published after the connection came up, leaving a device permanently
-        announcing a state it had already left. Holding only the newest value
-        per topic makes that impossible.
+        Returns None when the link is not ready. Caller holds _pending_lock.
+        """
+        with self._hold_lock:
+            if not self._link_ready or not self.mqttc.is_connected():
+                return None
+        return self.mqttc.publish(topic, data, qos, retain)
 
-        Bounded by ``pending_limit``, evicting the oldest topic, so a client
+    def _hold_or_drop(self, topic: str, data: Any, qos: int, retain: bool) -> Any:
+        """Hold a publish refused for want of a link, or drop it. Caller holds _hold_lock."""
+        if (retain or qos > 0) and not self._stopped:
+            self._hold(topic, data, qos, retain)
+            disposition = "held"
+        else:
+            disposition = "dropped"
+        logging.debug(
+            f"reason=mqttPublishNotConnected,client={self.client_id},"
+            f"topic={topic},qos={qos},disposition={disposition}"
+        )
+        msg_info = mqtt.MQTTMessageInfo(0)
+        msg_info.rc = mqtt.MQTT_ERR_NO_CONN
+        return msg_info
+
+    def _hold(self, topic: str, data: Any, qos: int, retain: bool) -> None:
+        """Keep a publish until the link is up. Caller holds _hold_lock.
+
+        A retained publish is keyed by topic, keeping the newest value, which is
+        not an optimisation: retained state is last-value-wins, so a queue that
+        replayed every attempt in order could write a stale value on top of a
+        newer one, leaving a device permanently announcing a state it had
+        already left. A non-retained publish gets its own key, so events keep
+        their order and none is merged away.
+
+        Bounded by ``pending_limit``, evicting the oldest entry, so a client
         that never connects cannot grow forever. An overflow is reported once
         and then sampled, rather than once per drop.
         """
-        if topic not in self._pending and len(self._pending) >= self.pending_limit:
+        key: str | tuple[str, int]
+        if retain:
+            key = topic
+        else:
+            key = ("event", self._pending_seq)
+            self._pending_seq += 1
+        limit = self.pending_limit + self._pending_extra
+        if key not in self._pending and len(self._pending) >= limit:
             self._pending.popitem(last=False)
-            self._pending_dropped += 1
-            if self._pending_dropped == 1 or self._pending_dropped % 100 == 0:
-                logging.warning(
-                    f"reason=mqttPendingOverflow,client={self.client_id},"
-                    f"limit={self.pending_limit},dropped={self._pending_dropped}"
-                )
-        self._pending[topic] = (data, qos, retain)
-        self._pending.move_to_end(topic)
+            self._note_pending_dropped()
+        self._pending[key] = (topic, data, qos, retain)
+        self._pending.move_to_end(key)
+
+    def _note_pending_dropped(self) -> None:
+        self._pending_dropped += 1
+        if self._pending_dropped == 1 or self._pending_dropped % 100 == 0:
+            logging.warning(
+                f"reason=mqttPendingOverflow,client={self.client_id},"
+                f"limit={self.pending_limit},dropped={self._pending_dropped}"
+            )
+
+    def _prepend(self, older: list[tuple[str, Any, int, bool]]) -> None:
+        """Put entries an interrupted flush did not send back in front of the
+        hold. Caller holds _hold_lock.
+
+        A retained topic held in both keeps the newer (already held) value. The
+        older entries were already accepted into the hold, so they widen
+        ``pending_limit`` until the next flush rather than being evicted by
+        what was held since. After :meth:`stop` they are discarded instead.
+        """
+        if self._stopped:
+            return
+        self._pending_extra += len(older)
+        newer, self._pending = self._pending, OrderedDict()
+        for entry in older:
+            self._hold(*entry)
+        for entry in newer.values():
+            self._hold(*entry)
 
     def _flush_pending(self) -> None:
-        """Publish what was held while disconnected, oldest topic first.
+        """Publish what was held while disconnected, oldest first, then mark the
+        link ready so later publishes go straight to paho.
 
         Runs on paho's network thread from :meth:`_on_connect`, under the same
-        lock :meth:`publish` takes, so a caller publishing concurrently either
-        lands entirely before the flush (and is therefore in the hold) or
-        entirely after it. Without that, a caller could publish a newer value
-        for a held topic between the drain and the flush's own publish, and the
-        older held value would then overwrite it on the broker: the same
-        stale-retained-state hazard the by-topic hold exists to prevent, just
-        arriving by a different route.
+        lock :meth:`publish` takes for a live link, so a caller publishing
+        concurrently either lands in the hold (the link is not ready yet) or
+        after the flush. Without that, a newer value could reach the broker
+        ahead of an older held one for the same topic and be overwritten by it.
 
-        A publish refused again (the link dropped mid-flush) goes back into the
+        The flush publishes on a live link, so paho applies
+        ``max_inflight_messages`` to it and queues the excess, rather than
+        bursting past the broker's receive quota.
+
+        If the link drops mid-flush, what was not sent goes back in front of the
         hold rather than being lost, so it survives to the next connect.
         """
         with self._pending_lock:
-            if not self._pending:
+            with self._hold_lock:
+                if self._stopped:
+                    return
+                held, self._pending = self._pending, OrderedDict()
+                self._pending_extra = 0
+                self._link_ready = True
+            if not held:
                 return
-            held, self._pending = self._pending, OrderedDict()
+            unsent: list[tuple[str, Any, int, bool]] = []
             failed = 0
-            for topic, (data, qos, retain) in held.items():
-                info = self._publish_locked(topic, data, qos, retain)
-                if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            for entry in held.values():
+                topic, data, qos, retain = entry
+                try:
+                    info = self._send(topic, data, qos, retain)
+                except Exception:
+                    # publish() validates before holding, so this is paho
+                    # rejecting something unforeseen. Raising here would end
+                    # paho's network loop and lose the rest of the hold.
+                    logging.warning(
+                        f"reason=mqttPublishInvalid,client={self.client_id},topic={topic}",
+                        exc_info=True,
+                    )
                     failed += 1
+                    continue
+                if info is None or (info.rc == mqtt.MQTT_ERR_NO_CONN and qos == 0):
+                    unsent.append(entry)
+                elif info.rc not in (mqtt.MQTT_ERR_SUCCESS, mqtt.MQTT_ERR_NO_CONN):
+                    # NO_CONN at QoS 1 or 2: paho stored it and resends it itself.
+                    failed += 1
+                    logging.warning(
+                        f"reason=mqttPublishFail,client={self.client_id},topic={topic},rc={info.rc}"
+                    )
+            if unsent:
+                # The link dropped mid-flush. What was not sent predates anything
+                # held since the drop, so it goes back in front of it.
+                with self._hold_lock:
+                    self._prepend(unsent)
             logging.info(
                 f"reason=mqttPendingFlushed,client={self.client_id},"
-                f"count={len(held)},failed={failed}"
+                f"count={len(held)},unsent={len(unsent)},failed={failed}"
             )
 
     def publish_and_flush(
@@ -559,30 +717,44 @@ class MqttClient:
 
         Always bounded and safe: never blocks indefinitely, and never raises for
         the common failure modes. Returns True once the message is published;
-        returns False immediately if there is no client or the client is not
-        connected, if the publish call itself fails, or if the flush does not
-        complete within ``timeout``.
+        returns False immediately if there is no client or the link is not up
+        (including after CONNACK, until the flush begins; a call made during
+        the flush waits for it, then publishes), if the publish call itself
+        fails, or if the flush does not complete within ``timeout``. It never
+        holds the message.
         """
         if not hasattr(self, "mqttc"):
             logging.error(f"reason=mqttPublishFlushNoClient,client={self.client_id},topic={topic}")
             return False
-        if not self.mqttc.is_connected():
+        # Checked before _pending_lock, as in publish(), so a call from
+        # on_disconnect_callback cannot deadlock (on_disconnect clears the flag
+        # before invoking it).
+        with self._hold_lock:
+            ready = self._link_ready
+        msg_info = None
+        if ready:
+            # Under _pending_lock, like publish(), so it cannot land ahead of an
+            # older held value that the flush is about to send for the same topic.
+            with self._pending_lock:
+                msg_info = self._send(topic, data, qos, retain)
+        if msg_info is None:
             logging.warning(
                 f"reason=mqttPublishFlushNotConnected,client={self.client_id},topic={topic}"
             )
             return False
-        msg_info = self.mqttc.publish(topic, data, qos, retain)
         if msg_info.rc != mqtt.MQTT_ERR_SUCCESS:
             logging.warning(f"reason=mqttPublishFail,client={self.client_id},topic={topic}")
             return False
         try:
             msg_info.wait_for_publish(timeout)
+            # paho 1.6.1's wait returns, rather than raises, on a failure set
+            # while waiting; is_published() raises on it in both majors.
+            return bool(msg_info.is_published())
         except (RuntimeError, ValueError) as e:
             logging.warning(
                 f"reason=mqttPublishFlushTimeout,client={self.client_id},topic={topic},err={e}"
             )
             return False
-        return bool(msg_info.is_published())
 
     def subscribe(self, sub: str, param: Any, qos: int = 1):
         if not hasattr(self, "mqttc"):
@@ -616,13 +788,22 @@ class MqttClient:
         logging.info(f"reason=mqttUnsubscribed,client={self.client_id},sub={sub}")
         return True
 
-    def _on_connect(self, mqttc: mqtt.Client, userdata: Any, flags: int, rc: int):
+    def _on_connect(
+        self, mqttc: mqtt.Client, userdata: Any, flags: Any, rc: Any, properties: Any = None
+    ):
+        # ``properties`` is passed by paho for MQTTv5 only (VERSION1 callbacks).
+        if rc != 0:
+            logging.warning(f"reason=mqttBrokerConnectRefused,client={self.client_id},rc={rc}")
+            return
         logging.info(f"reason=mqttBrokerConnected,client={self.client_id}")
 
         # Before the subscriptions and before the caller's callback: whatever
         # was published while disconnected describes state that already exists,
         # so it belongs on the broker before anything reacts to being connected.
-        # Anything the callback publishes is newer and therefore lands after.
+        # The callback's publishes reach paho after the flush, but a broker may
+        # apply a QoS 2 message only at PUBREL (mosquitto does), so a retained
+        # value the callback republishes wins over a flushed one only at the
+        # same or a higher QoS.
         self._flush_pending()
 
         # Re-subscribe on reconnect (iterate shallow copy in case dict changes)
@@ -636,7 +817,11 @@ class MqttClient:
         if self.on_connect_callback:
             self.on_connect_callback()
 
-    def _on_disconnect(self, mqttc: mqtt.Client, userdata: Any, rc: int):
+    def _on_disconnect(self, mqttc: mqtt.Client, userdata: Any, rc: Any, properties: Any = None):
+        # Before anything else, so a publish from here on (including from
+        # on_disconnect_callback) is held rather than handed to paho.
+        with self._hold_lock:
+            self._link_ready = False
         if self.is_running and rc != mqtt.MQTT_ERR_SUCCESS:
             logging.warning(f"reason=mqttBrokerConnectionLost,rc={rc},client={self.client_id}")
         else:

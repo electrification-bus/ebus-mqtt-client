@@ -4,6 +4,7 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import paho.mqtt.client as mqtt
 import pytest
 
 from ebus_mqtt_client import MqttClient
@@ -537,15 +538,27 @@ class TestUnsubscribe:
 
 class TestPublish:
     def test_publish_calls_paho(self, mock_paho):
+        mock_paho["instance"].is_connected.return_value = True
         client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        client._link_ready = True  # what the flush on connect sets
         client.publish("topic/a", "data", qos=0, retain=True)
         mock_paho["instance"].publish.assert_called_once_with("topic/a", "data", 0, True)
 
     def test_publish_returns_msg_info(self, mock_paho):
+        mock_paho["instance"].is_connected.return_value = True
         msg_info = MagicMock(rc=0)
         mock_paho["instance"].publish.return_value = msg_info
         client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        client._link_ready = True
         assert client.publish("topic/a", "data") is msg_info
+
+    def test_publish_while_disconnected_never_reaches_paho(self, mock_paho):
+        # Handing paho a publish while the link is down is what lets it replay an
+        # uncapped burst on CONNACK (GH #20), so the wrapper holds it instead.
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        info = client.publish("topic/a", "data", qos=2, retain=True)
+        mock_paho["instance"].publish.assert_not_called()
+        assert info.rc == mqtt.MQTT_ERR_NO_CONN
 
     def test_publish_no_client_returns_none(self, mock_paho):
         client = MqttClient(client_id="test", endpoint="localhost", port=1883)
@@ -560,6 +573,7 @@ class TestPublishAndFlush:
         mock_paho["instance"].is_connected.return_value = True
         mock_paho["instance"].publish.return_value = msg_info
         client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        client._link_ready = True
 
         assert client.publish_and_flush("topic/a", "data", timeout=0.5) is True
         msg_info.wait_for_publish.assert_called_once_with(0.5)

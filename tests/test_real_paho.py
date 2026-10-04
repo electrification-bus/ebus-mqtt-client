@@ -49,58 +49,70 @@ def test_v5_construction_creates_real_paho_client():
     assert isinstance(c.mqttc, mqtt.Client)
 
 
-def test_publish_before_connect_returns_real_message_info():
-    # Real paho returns an MQTTMessageInfo even when not connected (its rc
-    # reflects the no-connection state); the wrapper returns it unchanged.
+def test_a_publish_before_connect_returns_a_message_info():
+    # Not paho's: a not-ready publish never reaches paho, and the wrapper returns
+    # a plain MQTTMessageInfo of its own with rc=MQTT_ERR_NO_CONN, the code paho
+    # reports for a refused publish.
     c = _make()
     info = c.publish("t/x", "payload")
     assert isinstance(info, mqtt.MQTTMessageInfo)
-    assert hasattr(info, "rc")
+    assert info.rc == mqtt.MQTT_ERR_NO_CONN
 
 
 def test_real_paho_refuses_a_disconnected_publish_with_no_conn():
-    # The linchpin of the hold-until-connected behavior (tests/test_pending_
-    # publishes.py): the wrapper distinguishes "not connected yet" from a real
-    # failure purely by this result code, so if a paho major ever reported
-    # something else here, retained state would go back to being dropped and
-    # logged as a failure. Assert the code itself, un-mocked, on both majors.
+    # publish() and _flush_pending tell a lost link from a real failure by this
+    # result code alone: at QoS 0 they hold the message, and at QoS 1 and 2 they
+    # leave it to paho, which has already stored it. Assert both against the
+    # real library on both majors.
     c = _make()
-    assert c.publish("t/x", "payload").rc == mqtt.MQTT_ERR_NO_CONN
+    info = c.mqttc.publish("t/x", "payload", 1, False)
+    assert info.rc == mqtt.MQTT_ERR_NO_CONN
+    assert info.mid in c.mqttc._out_messages
 
 
 def test_a_qos0_retained_publish_before_connect_is_held_not_lost():
     c = _make()
     c.publish("t/state", "ready", qos=0, retain=True)
-    assert c._pending == {"t/state": ("ready", 0, True)}
-    # A non-retained publish is an event, not state, so it is not held.
+    assert [e[:4] for e in c._pending.values()] == [("t/state", "ready", 0, True)]
+    # A non-retained QoS 0 publish is a fire-and-forget event, so it is not held.
     c.publish("t/event", "happened", qos=0)
-    assert "t/event" not in c._pending
+    assert len(c._pending) == 1
 
 
-def test_real_paho_keeps_qos1_itself_which_is_why_it_is_not_held():
-    # The hold is scoped to QoS 0 because that is the only QoS at which paho
-    # actually loses a refused message. At QoS 1 and 2 it stores the message in
-    # its own out-queue before returning MQTT_ERR_NO_CONN and re-sends it from
-    # _handle_connack, so holding it here too would publish it twice per
-    # connect. That is a claim about paho's internals across the 1.x/2.x
-    # boundary, so assert it against the real library: if a future paho stops
-    # queueing, this fails and the scoping has to be revisited.
+@pytest.mark.parametrize("qos", [1, 2])
+def test_a_higher_qos_publish_before_connect_is_held_and_never_reaches_paho(qos):
+    # paho would store a refused QoS 1/2 publish and replay it on CONNACK in one
+    # burst that ignores max_inflight and lands after on_connect (GH #20). The
+    # wrapper therefore keeps it out of paho entirely; assert that against the
+    # real library on both majors.
     c = _make()
-    info = c.publish("t/state", "ready", qos=1, retain=True)
+    info = c.publish("t/state", "ready", qos=qos, retain=True)
     assert info.rc == mqtt.MQTT_ERR_NO_CONN
-    assert c._pending == {}, "QoS 1 is paho's to re-send, not ours to hold"
-    queued = c.mqttc._out_messages
-    assert len(queued) == 1
-    assert next(iter(queued.values())).payload == b"ready"
+    assert [e[:4] for e in c._pending.values()] == [("t/state", "ready", qos, True)]
+    assert c.mqttc._out_messages == {}
 
 
-def test_real_paho_keeps_nothing_at_qos0_which_is_why_it_is_held():
-    # The other half of the same claim, and the reason the hold exists at all.
+def test_real_paho_keeps_nothing_at_qos0():
     c = _make()
     c.publish("t/state", "ready", qos=0, retain=True)
     assert c.mqttc._out_messages == {}
 
 
-def test_publish_and_flush_unconnected_is_false():
+def _pretend_connected(c):
+    """paho's connected state with no socket: what it reports after its network
+    loop has closed the socket on a dropped link and before on_disconnect runs."""
+    state = getattr(mqtt, "_ConnectionState", None)
+    c.mqttc._state = state.MQTT_CS_CONNECTED if state else mqtt.mqtt_cs_connected
+    c._link_ready = True
+
+
+@pytest.mark.parametrize("qos", [1, 2])
+def test_a_publish_refused_in_the_drop_window_is_left_to_paho(qos):
+    # paho stores a QoS 1/2 publish it refuses and resends it itself, so the
+    # wrapper does not hold it as well.
     c = _make()
-    assert c.publish_and_flush("t/x", "payload", timeout=0.1) is False
+    _pretend_connected(c)
+    info = c.publish("t/state", "ready", qos=qos, retain=True)
+    assert info.rc == mqtt.MQTT_ERR_NO_CONN
+    assert len(c.mqttc._out_messages) == 1
+    assert not c._pending
