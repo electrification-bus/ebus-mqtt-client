@@ -4,6 +4,26 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+
+- Retained state published while the link is down no longer ends on a stale or dropped value at QoS 1 and 2 ([#20](https://github.com/electrification-bus/ebus-mqtt-client/issues/20)). Such a publish was handed to paho, which stores it and on CONNACK replays its whole queue in one burst that ignores `max_inflight_messages` and lands after `on_connect`. At QoS 1 and 2 a value republished from `on_connect_callback` was then overwritten by paho's older copy. At QoS 2 the burst could also exceed mosquitto's per-client receive quota (`max_inflight_messages`, default 20), and for an MQTT 3.1.1 client mosquitto acknowledges the excess and discards it, so whichever value fell past the quota was lost without any error on either side. A device that builds its tree before the connection is up hit both: with ebus-sdk's `simple-device` and `simple-tree-device` examples the root's retained `$state` ended on `init` instead of `ready`.
+
+  The wrapper now never hands paho a publish while the link is down. Retained publishes at every QoS are held newest-value-per-topic, as QoS 0 already was; non-retained QoS 1 and 2 publishes are held in order, one entry each; non-retained QoS 0 is still dropped. The link counts as down from the disconnect until the flush on the next connect takes the hold, so a publish issued between CONNACK and the flush joins the hold instead of overtaking it. The hold is flushed before `on_connect_callback`, on a live link where paho's inflight cap applies; a retained value the callback republishes wins over a flushed value for the same topic at the same or a higher QoS (a broker may apply QoS 2 only at PUBREL, as mosquitto does, so a lower-QoS republish can be overtaken). `pending_limit` now bounds every held entry, not only QoS 0 retained topics. Nothing is held between `stop()` (the client's or the asyncio driver's) and the next start. Arguments paho rejects (a non-`str` or wildcard topic, an empty topic under MQTT 3.1.1, an invalid QoS, an unencodable payload) still raise from `publish()` while the link is down, as they did when such a publish went to paho. A held publish still returns an `MQTTMessageInfo` with `rc == MQTT_ERR_NO_CONN`.
+
+  Not covered: what paho had accepted on a live link and not finished delivering when the link dropped is still replayed by paho, after `on_connect` and uncapped ([#21](https://github.com/electrification-bus/ebus-mqtt-client/issues/21)).
+
+- `publish_and_flush()` is serialized against the flush, so a final retained value (ebus-sdk publishes its graceful `$state` this way) can no longer land ahead of an older held value for the same topic and be overwritten by it. It returns `False` while the link is down, including between CONNACK and the flush.
+- A publish from `on_disconnect_callback` can no longer deadlock against another thread's publish. paho can invoke the callback while holding its own out-queue mutex; such a call now reads the link as down without taking the lock a publishing thread holds across its call into paho.
+- With `v5=True`, connecting no longer raises `TypeError`. paho passes MQTTv5 `on_connect` and `on_disconnect` callbacks a trailing `properties` argument that the internal handlers did not accept, so CONNACK raised in the network loop, `on_connect_callback` never ran, and subscriptions were not recovered.
+
+### Changed
+
+- A refused CONNACK (nonzero result code) no longer flushes the hold, recovers subscriptions, or invokes `on_connect_callback`; those now run only on a successful connect. Flushing on a refused connection would mark the link ready and send publishes to paho while it is down.
+
+### Added
+
+- `tests/test_broker.py`: tests against a real mosquitto, started per test on a free port and skipped when no `mosquitto` binary is found; CI installs mosquitto so they run there. These fail on 0.5.0: the pre-connect burst past the broker quota, the `on_connect` republish overwritten by an older value, a publish between CONNACK and the flush, MQTTv5 connect, and a publish after the asyncio driver stops. The file also runs mTLS handshakes against a broker that requires client certificates: certificate and key paths, in-memory certificate and key, a password-protected key, refusal of a client without a certificate, and refusal of a server certificate from an untrusted CA.
+
 ## [0.5.0] - 2026-08-21
 
 ### Fixed

@@ -21,9 +21,9 @@ jobs:
         # "latest" is whatever .[dev] resolves (the current paho 2.x); "1.x" is
         # the paho-mqtt>=1.5.0 floor the package still declares support for. The
         # wrapper targets paho's VERSION1 callback API, which both majors
-        # provide, but only the un-mocked tests/test_real_paho.py smoke tests
-        # actually cross that boundary (the rest of the suite mocks
-        # paho.mqtt.client.Client).
+        # provide, but only the un-mocked tests/test_real_paho.py smoke tests and
+        # the broker-backed tests/test_broker.py actually cross that boundary
+        # (the rest of the suite mocks paho.mqtt.client.Client).
         paho: ["latest", "1.x"]
         # paho-major compatibility is orthogonal to the interpreter, so exercise
         # 1.x only on the oldest and newest supported Python rather than the full
@@ -38,6 +38,9 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
+      # tests/test_broker.py runs against a real broker and skips without one.
+      - name: Install mosquitto
+        run: sudo apt-get update && sudo apt-get install -y mosquitto
       - run: pip install -e '.[dev]'
       # For the 1.x rows, downgrade paho from the 2.x that .[dev] resolved so the
       # suite actually runs against the older major.
