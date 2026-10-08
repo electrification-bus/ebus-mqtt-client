@@ -4,6 +4,8 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-08
+
 ### Fixed
 
 - Resubscribing a filter with a different `with_retain` while messages are arriving no longer drops a message. The callback and the flag were stored and read separately, so a message delivered on paho's network thread mid-resubscribe could reach the new callback with the old arity (or the reverse), raise `TypeError`, and be logged as `onMessageClientCallbackException`. They are now stored together and read with one lookup.
