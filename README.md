@@ -47,6 +47,23 @@ client.publish("sensors/temp", "22.5")
 client.stop()
 ```
 
+### Seeing the retain flag
+
+A subscription callback receives `(topic, payload)`. Pass `with_retain=True` to `subscribe()` and it receives `(topic, payload, retained)` instead, where `retained` is paho's `msg.retain` as a `bool`:
+
+```python
+def on_set(topic, payload, retained):
+    if retained:
+        return  # a stored retained message replayed at subscribe, not a live command
+    apply(payload)
+
+client.subscribe("devices/my-client/+/set", on_set, with_retain=True)
+```
+
+Under MQTT 3.1.1 a broker sets the flag on delivery only when it replays a stored retained message to a new subscription, including the resubscribe after every reconnect. A message published while the subscription is in place arrives with `retained=False`, even when it was published retained. The flag is per subscription and is kept across reconnects. When the client was constructed with a `callback`, that callback receives `(topic, payload, param, retained)` for such a subscription.
+
+A delivery carries no record of which subscription caused it, and each message is routed to the callback of one matching filter only. With overlapping filters, `retained=True` therefore also marks a replay caused by subscribing (or resubscribing) any other filter that overlaps this one, and a message may reach the other filter's callback instead. `subscribe()` logs a warning (`reason=mqttSubscribeWithRetainOverlap`) when a `with_retain` filter overlaps another.
+
 ### Graceful shutdown
 
 Publish a final retained message and flush it (bounded) before disconnecting, then stop within a time bound even when the broker is unreachable:

@@ -62,6 +62,29 @@ def _validate_publish(topic: Any, data: Any, qos: Any, v5: bool) -> None:
         raise ValueError("Payload too large.")
 
 
+def _filters_overlap(a: str, b: str) -> bool:
+    """True when some topic matches both filters ``a`` and ``b``.
+
+    Follows MQTT matching: ``+`` matches one level, ``#`` matches the parent
+    level and everything below it, and a wildcard in the first level does not
+    match a topic that starts with ``$``.
+    """
+    la, lb = a.split("/"), b.split("/")
+    for i, (x, y) in enumerate(zip(la, lb, strict=False)):
+        if x in ("#", "+") or y in ("#", "+"):
+            if i == 0 and (x.startswith("$") or y.startswith("$")):
+                return False
+            if x == "#" or y == "#":
+                return True
+            continue
+        if x != y:
+            return False
+    if len(la) == len(lb):
+        return True
+    longer = la if len(la) > len(lb) else lb
+    return len(longer) == min(len(la), len(lb)) + 1 and longer[-1] == "#"
+
+
 class MqttClient:
     """MQTT client wrapper around paho-mqtt.
 
@@ -135,6 +158,8 @@ class MqttClient:
         self.mqttc.on_message = self._on_message
         self.mqttc.user_data_set(callback)
         self.sub_callbacks: dict[str, tuple[Any, int]] = {}
+        # Filters subscribed with ``with_retain=True``.
+        self._sub_with_retain: set[str] = set()
         self.sub_matcher = matcher.MQTTMatcher()
         self.on_connect_callback = on_connect_callback
         self.on_disconnect_callback = on_disconnect_callback
@@ -450,6 +475,7 @@ class MqttClient:
         self._discard_hold()
         # Release subscription callbacks and matcher to free memory
         self.sub_callbacks.clear()
+        self._sub_with_retain.clear()
         self.sub_matcher = matcher.MQTTMatcher()
         self.on_connect_callback = None
         self.on_disconnect_callback = None
@@ -756,11 +782,50 @@ class MqttClient:
             )
             return False
 
-    def subscribe(self, sub: str, param: Any, qos: int = 1):
+    def subscribe(self, sub: str, param: Any, qos: int = 1, *, with_retain: bool = False):
+        """Subscribe to the topic filter ``sub``.
+
+        A message matching ``sub`` is delivered as ``param(topic, payload)``, or,
+        when the client was constructed with a ``callback``, as
+        ``callback(topic, payload, param)``.
+
+        With ``with_retain=True`` the delivery gains a trailing ``retained`` bool
+        (paho's ``msg.retain``): ``param(topic, payload, retained)`` or
+        ``callback(topic, payload, param, retained)``. Under MQTT 3.1.1 a broker
+        sets the flag only when it replays a stored retained message to a new
+        subscription, so ``retained`` is True for that replay and False for a
+        message published while the subscription was already in place.
+
+        A delivery carries no record of which subscription caused it, and each
+        message is routed to one matching filter only. When filters overlap,
+        ``retained`` is therefore also True for a replay caused by subscribing
+        (or resubscribing, as reconnect recovery does) any other filter that
+        overlaps this one, and a message may be routed to the other filter's
+        callback instead. A ``with_retain`` subscription that overlaps another
+        is logged as a warning.
+
+        The subscription, ``with_retain`` included, is restored on reconnect.
+        Subscribing to the same filter again replaces its ``param``, ``qos`` and
+        ``with_retain``.
+        """
         if not hasattr(self, "mqttc"):
             logging.error(f"reason=mqttSubscribeNoClient,client={self.client_id},sub={sub}")
             return
+        for other in self.sub_callbacks:
+            if (
+                other != sub
+                and (with_retain or other in self._sub_with_retain)
+                and _filters_overlap(sub, other)
+            ):
+                logging.warning(
+                    f"reason=mqttSubscribeWithRetainOverlap,client={self.client_id},"
+                    f"sub={sub},overlaps={other}"
+                )
         self.sub_callbacks[sub] = (param, qos)
+        if with_retain:
+            self._sub_with_retain.add(sub)
+        else:
+            self._sub_with_retain.discard(sub)
         self.sub_matcher[sub] = sub
         self.mqttc.subscribe(sub, qos)
 
@@ -782,6 +847,7 @@ class MqttClient:
             logging.debug(f"reason=mqttUnsubscribeUnknownSub,client={self.client_id},sub={sub}")
             return False
         del self.sub_callbacks[sub]
+        self._sub_with_retain.discard(sub)
         with contextlib.suppress(KeyError):
             del self.sub_matcher[sub]
         self.mqttc.unsubscribe(sub)
@@ -860,10 +926,12 @@ class MqttClient:
             return
 
         try:
+            param = self.sub_callbacks[sub][0]
+            extra = (bool(msg.retain),) if sub in self._sub_with_retain else ()
             if userdata:
-                userdata(msg.topic, msg.payload, self.sub_callbacks[sub][0])
+                userdata(msg.topic, msg.payload, param, *extra)
             else:
-                self.sub_callbacks[sub][0](msg.topic, msg.payload)
+                param(msg.topic, msg.payload, *extra)
         except Exception:
             logging.warning(
                 f"reason=onMessageClientCallbackException,topic={msg.topic}",
