@@ -780,6 +780,35 @@ class TestWithRetain:
         client._on_message(mock_paho["instance"], None, _msg("a/x", b"1", True))
         handler.assert_called_once_with("a/x", b"1")
 
+    @pytest.mark.parametrize("first_with_retain", [False, True])
+    def test_resubscribe_never_pairs_param_with_the_other_flag(self, mock_paho, first_with_retain):
+        # A message delivered after any of subscribe()'s writes (as paho's
+        # network thread may) must reach either the old callback with the old
+        # arity or the new one with the new arity.
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        calls = []
+
+        def two_arg(topic, payload):
+            calls.append("two")
+
+        def three_arg(topic, payload, retained):
+            calls.append("three")
+
+        old, new = (three_arg, two_arg) if first_with_retain else (two_arg, three_arg)
+        client.subscribe("a/#", old, with_retain=first_with_retain)
+
+        class DeliverOnWrite(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                client._on_message(mock_paho["instance"], None, _msg("a/x", b"1", True))
+
+        for name in ("sub_callbacks", "_sub_delivery"):
+            setattr(client, name, DeliverOnWrite(getattr(client, name)))
+        with patch("ebus_mqtt_client.client.logging.warning") as warn:
+            client.subscribe("a/#", new, with_retain=not first_with_retain)
+        assert not [c for c in warn.call_args_list if "CallbackException" in c.args[0]]
+        assert len(calls) == 2 and calls[-1] == ("three" if new is three_arg else "two")
+
     def test_sub_callbacks_shape_is_unchanged(self, mock_paho):
         client = MqttClient(client_id="test", endpoint="localhost", port=1883)
         handler = MagicMock()
