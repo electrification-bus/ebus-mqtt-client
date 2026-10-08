@@ -268,6 +268,40 @@ async def _await(cond, timeout=5.0):
     return False
 
 
+def test_with_retain_tells_a_replayed_retained_message_from_a_live_one(broker):
+    # GH #24. Under MQTT 3.1.1 the broker sets the retain flag on delivery only
+    # when it replays a stored retained message to a new subscription; a message
+    # forwarded to a subscription already in place arrives with it cleared, even
+    # when it was published retained.
+    seeder = mqtt.Client(client_id=f"seed-{time.monotonic_ns()}")
+    seeder.connect("127.0.0.1", broker)
+    seeder.loop_start()
+    seeder.publish("t/cmd/set", "stale", qos=1, retain=True).wait_for_publish(5)
+    seeder.loop_stop()
+    seeder.disconnect()
+
+    got: list[tuple[str, bytes, bool]] = []
+    plain: list[tuple] = []
+    c = _client(broker)
+    c.subscribe("t/cmd/#", lambda *a: got.append(a), with_retain=True)
+    c.subscribe("t/plain/#", lambda *a: plain.append(a))
+    c.start()
+    try:
+        assert _wait(lambda: len(got) == 1)
+        c.publish("t/cmd/set", "live-retained", qos=1, retain=True)
+        c.publish("t/cmd/set", "live", qos=1)
+        c.publish("t/plain/x", "p", qos=1, retain=True)
+        assert _wait(lambda: len(got) == 3 and len(plain) == 1)
+    finally:
+        c.stop()
+    assert got == [
+        ("t/cmd/set", b"stale", True),
+        ("t/cmd/set", b"live-retained", False),
+        ("t/cmd/set", b"live", False),
+    ]
+    assert plain == [("t/plain/x", b"p")]
+
+
 OPENSSL = shutil.which("openssl")
 KEY_PASSWORD = "test-passphrase"
 

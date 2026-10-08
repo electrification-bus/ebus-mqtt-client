@@ -2,7 +2,7 @@ import os
 import ssl
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import paho.mqtt.client as mqtt
 import pytest
@@ -701,3 +701,87 @@ class TestOnMessage:
 
         # Should be a no-op (logs a warning), not raise
         client._on_message(mock_paho["instance"], None, msg)
+
+
+def _msg(topic, payload, retain):
+    msg = MagicMock()
+    msg.topic = topic
+    msg.payload = payload
+    msg.retain = retain
+    return msg
+
+
+class TestWithRetain:
+    """GH #24: opt-in delivery of paho's msg.retain to subscription callbacks."""
+
+    def test_default_delivery_omits_the_flag(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("a/+", handler)
+        client._on_message(mock_paho["instance"], None, _msg("a/b", b"x", 1))
+        handler.assert_called_once_with("a/b", b"x")
+
+    @pytest.mark.parametrize("retain, expected", [(1, True), (0, False)])
+    def test_with_retain_appends_the_flag(self, mock_paho, retain, expected):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("a/+", handler, with_retain=True)
+        client._on_message(mock_paho["instance"], None, _msg("a/b", b"x", retain))
+        handler.assert_called_once_with("a/b", b"x", expected)
+        assert type(handler.call_args.args[2]) is bool
+
+    def test_userdata_form_without_and_with_the_flag(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        dispatch = MagicMock()
+        client.subscribe("plain/#", "p1")
+        client.subscribe("flagged/#", "p2", with_retain=True)
+        client._on_message(mock_paho["instance"], dispatch, _msg("plain/x", b"1", True))
+        client._on_message(mock_paho["instance"], dispatch, _msg("flagged/x", b"2", True))
+        assert dispatch.call_args_list == [
+            call("plain/x", b"1", "p1"),
+            call("flagged/x", b"2", "p2", True),
+        ]
+
+    def test_flag_is_per_subscription(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        plain, flagged = MagicMock(), MagicMock()
+        client.subscribe("plain/#", plain)
+        client.subscribe("flagged/#", flagged, with_retain=True)
+        client._on_message(mock_paho["instance"], None, _msg("plain/x", b"1", False))
+        client._on_message(mock_paho["instance"], None, _msg("flagged/x", b"2", False))
+        plain.assert_called_once_with("plain/x", b"1")
+        flagged.assert_called_once_with("flagged/x", b"2", False)
+
+    def test_resubscribe_replaces_the_flag(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("a/#", handler, with_retain=True)
+        client.subscribe("a/#", handler)
+        client._on_message(mock_paho["instance"], None, _msg("a/x", b"1", True))
+        handler.assert_called_once_with("a/x", b"1")
+
+    def test_flag_survives_reconnect_recovery(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("a/#", handler, qos=2, with_retain=True)
+        mock_paho["instance"].subscribe.reset_mock()
+        client._on_disconnect(mock_paho["instance"], None, 1)
+        client._on_connect(mock_paho["instance"], None, {}, 0)
+        mock_paho["instance"].subscribe.assert_called_once_with("a/#", 2)
+        client._on_message(mock_paho["instance"], None, _msg("a/x", b"1", True))
+        handler.assert_called_once_with("a/x", b"1", True)
+
+    def test_unsubscribe_forgets_the_flag(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("a/#", handler, with_retain=True)
+        client.unsubscribe("a/#")
+        client.subscribe("a/#", handler)
+        client._on_message(mock_paho["instance"], None, _msg("a/x", b"1", True))
+        handler.assert_called_once_with("a/x", b"1")
+
+    def test_sub_callbacks_shape_is_unchanged(self, mock_paho):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        handler = MagicMock()
+        client.subscribe("a/#", handler, qos=1, with_retain=True)
+        assert client.sub_callbacks["a/#"] == (handler, 1)
