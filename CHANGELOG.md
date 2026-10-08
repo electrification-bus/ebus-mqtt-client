@@ -4,6 +4,8 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-08
+
 ### Added
 
 - `subscribe()` takes a keyword-only `with_retain` flag ([#24](https://github.com/electrification-bus/ebus-mqtt-client/issues/24)). With `with_retain=True` the subscription's callback receives `(topic, payload, retained)`, where `retained` is paho's `msg.retain` as a `bool`, and a constructor `callback` receives `(topic, payload, param, retained)`. Under MQTT 3.1.1 the broker sets the flag only when it replays a stored retained message to a new subscription, so a subscriber can tell that replay from a live message. The flag is per subscription and is kept by subscription recovery on reconnect. Subscriptions made without it are delivered as before. A delivery carries no record of which subscription caused it and is routed to one matching filter only, so with overlapping filters `retained=True` also marks a replay caused by subscribing any overlapping filter; `subscribe()` logs a warning when a `with_retain` filter overlaps another.
