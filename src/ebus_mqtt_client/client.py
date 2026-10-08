@@ -62,6 +62,29 @@ def _validate_publish(topic: Any, data: Any, qos: Any, v5: bool) -> None:
         raise ValueError("Payload too large.")
 
 
+def _filters_overlap(a: str, b: str) -> bool:
+    """True when some topic matches both filters ``a`` and ``b``.
+
+    Follows MQTT matching: ``+`` matches one level, ``#`` matches the parent
+    level and everything below it, and a wildcard in the first level does not
+    match a topic that starts with ``$``.
+    """
+    la, lb = a.split("/"), b.split("/")
+    for i, (x, y) in enumerate(zip(la, lb, strict=False)):
+        if x in ("#", "+") or y in ("#", "+"):
+            if i == 0 and (x.startswith("$") or y.startswith("$")):
+                return False
+            if x == "#" or y == "#":
+                return True
+            continue
+        if x != y:
+            return False
+    if len(la) == len(lb):
+        return True
+    longer = la if len(la) > len(lb) else lb
+    return len(longer) == min(len(la), len(lb)) + 1 and longer[-1] == "#"
+
+
 class MqttClient:
     """MQTT client wrapper around paho-mqtt.
 
@@ -773,6 +796,14 @@ class MqttClient:
         subscription, so ``retained`` is True for that replay and False for a
         message published while the subscription was already in place.
 
+        A delivery carries no record of which subscription caused it, and each
+        message is routed to one matching filter only. When filters overlap,
+        ``retained`` is therefore also True for a replay caused by subscribing
+        (or resubscribing, as reconnect recovery does) any other filter that
+        overlaps this one, and a message may be routed to the other filter's
+        callback instead. A ``with_retain`` subscription that overlaps another
+        is logged as a warning.
+
         The subscription, ``with_retain`` included, is restored on reconnect.
         Subscribing to the same filter again replaces its ``param``, ``qos`` and
         ``with_retain``.
@@ -780,6 +811,16 @@ class MqttClient:
         if not hasattr(self, "mqttc"):
             logging.error(f"reason=mqttSubscribeNoClient,client={self.client_id},sub={sub}")
             return
+        for other in self.sub_callbacks:
+            if (
+                other != sub
+                and (with_retain or other in self._sub_with_retain)
+                and _filters_overlap(sub, other)
+            ):
+                logging.warning(
+                    f"reason=mqttSubscribeWithRetainOverlap,client={self.client_id},"
+                    f"sub={sub},overlaps={other}"
+                )
         self.sub_callbacks[sub] = (param, qos)
         if with_retain:
             self._sub_with_retain.add(sub)

@@ -8,7 +8,7 @@ import paho.mqtt.client as mqtt
 import pytest
 
 from ebus_mqtt_client import MqttClient
-from ebus_mqtt_client.client import MQTT_DEFAULT_HOST, MQTT_DEFAULT_PORT
+from ebus_mqtt_client.client import MQTT_DEFAULT_HOST, MQTT_DEFAULT_PORT, _filters_overlap
 
 
 # Patch paho.mqtt.client.Client so no real broker connection is attempted
@@ -785,3 +785,60 @@ class TestWithRetain:
         handler = MagicMock()
         client.subscribe("a/#", handler, qos=1, with_retain=True)
         assert client.sub_callbacks["a/#"] == (handler, 1)
+
+    @pytest.mark.parametrize(
+        "a, b, expected",
+        [
+            ("a/b", "a/b", True),
+            ("a/b", "a/c", False),
+            ("a/b", "a/+", True),
+            ("a/b", "a/#", True),
+            ("a", "a/#", True),
+            ("a", "a/+", False),
+            ("a/b/c", "a/+", False),
+            ("+/b", "a/+", True),
+            ("#", "x/y/z", True),
+            ("a/#", "b/#", False),
+            ("#", "$SYS/x", False),
+            ("+/x", "$SYS/x", False),
+            ("$SYS/#", "$SYS/x", True),
+        ],
+    )
+    def test_filters_overlap(self, a, b, expected):
+        assert _filters_overlap(a, b) is expected
+        assert _filters_overlap(b, a) is expected
+
+    @pytest.mark.parametrize(
+        "first, first_flag, second, second_flag",
+        [
+            ("a/b", True, "a/#", False),
+            ("a/#", True, "a/b", False),
+            ("a/#", False, "a/+", True),
+        ],
+    )
+    def test_overlap_with_a_with_retain_filter_warns(
+        self, mock_paho, caplog, first, first_flag, second, second_flag
+    ):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        client.subscribe(first, MagicMock(), with_retain=first_flag)
+        client.subscribe(second, MagicMock(), with_retain=second_flag)
+        assert (
+            f"reason=mqttSubscribeWithRetainOverlap,client=test,sub={second},overlaps={first}"
+            in (caplog.text)
+        )
+
+    @pytest.mark.parametrize(
+        "first, first_flag, second, second_flag",
+        [
+            ("a/#", False, "a/b", False),
+            ("a/#", True, "b/#", True),
+            ("a/#", True, "a/#", True),
+        ],
+    )
+    def test_no_warning_without_a_with_retain_overlap(
+        self, mock_paho, caplog, first, first_flag, second, second_flag
+    ):
+        client = MqttClient(client_id="test", endpoint="localhost", port=1883)
+        client.subscribe(first, MagicMock(), with_retain=first_flag)
+        client.subscribe(second, MagicMock(), with_retain=second_flag)
+        assert "mqttSubscribeWithRetainOverlap" not in caplog.text

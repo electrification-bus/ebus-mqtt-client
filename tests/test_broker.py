@@ -302,6 +302,33 @@ def test_with_retain_tells_a_replayed_retained_message_from_a_live_one(broker):
     assert plain == [("t/plain/x", b"p")]
 
 
+def test_with_retain_flag_marks_a_replay_caused_by_an_overlapping_subscription(broker):
+    # The documented limit of with_retain: a delivery carries no record of which
+    # subscription caused it, so a replay triggered by subscribing an overlapping
+    # filter reaches the with_retain callback (the first matching filter) with
+    # retained=True although its own subscription was in place throughout.
+    seeder = mqtt.Client(client_id=f"seed-{time.monotonic_ns()}")
+    seeder.connect("127.0.0.1", broker)
+    seeder.loop_start()
+    seeder.publish("t/ov/b", "R", qos=1, retain=True).wait_for_publish(5)
+    seeder.loop_stop()
+    seeder.disconnect()
+
+    flagged: list[tuple] = []
+    plain: list[tuple] = []
+    c = _client(broker)
+    c.subscribe("t/ov/b", lambda *a: flagged.append(a), with_retain=True)
+    c.start()
+    try:
+        assert _wait(lambda: len(flagged) == 1)
+        c.subscribe("t/ov/#", lambda *a: plain.append(a))
+        assert _wait(lambda: len(flagged) == 2)
+    finally:
+        c.stop()
+    assert flagged == [("t/ov/b", b"R", True), ("t/ov/b", b"R", True)]
+    assert plain == []
+
+
 OPENSSL = shutil.which("openssl")
 KEY_PASSWORD = "test-passphrase"
 
