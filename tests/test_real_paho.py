@@ -107,12 +107,26 @@ def _pretend_connected(c):
 
 
 @pytest.mark.parametrize("qos", [1, 2])
-def test_a_publish_refused_in_the_drop_window_is_left_to_paho(qos):
-    # paho stores a QoS 1/2 publish it refuses and resends it itself, so the
-    # wrapper does not hold it as well.
+def test_a_publish_refused_in_the_drop_window_is_stored_by_paho_not_held(qos):
+    # paho stores a QoS 1/2 publish it refuses, so the wrapper does not hold it
+    # as well; the next connect takes it back (GH #21).
     c = _make()
     _pretend_connected(c)
     info = c.publish("t/state", "ready", qos=qos, retain=True)
     assert info.rc == mqtt.MQTT_ERR_NO_CONN
     assert len(c.mqttc._out_messages) == 1
     assert not c._pending
+
+
+@pytest.mark.parametrize("qos", [1, 2])
+def test_what_paho_stored_can_be_taken_back_into_the_hold(qos):
+    # Canary for the layout _reclaim_leftovers relies on when paho has no
+    # public drop_out_messages() (GH #21).
+    c = _make()
+    _pretend_connected(c)
+    info = c.publish("t/state", "ready", qos=qos, retain=True)
+    with c._pending_lock:
+        c._reclaim_leftovers()
+    assert c.mqttc._out_messages == {}
+    assert list(c._pending.values()) == [("t/state", b"ready", qos, True)]
+    assert info.rc == mqtt.MQTT_ERR_NO_CONN

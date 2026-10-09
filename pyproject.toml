@@ -28,7 +28,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "paho-mqtt>=1.5.0",
+    "paho-mqtt>=1.5.0,<3",
 ]
 
 [project.optional-dependencies]

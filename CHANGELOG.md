@@ -4,6 +4,15 @@ All notable changes to `ebus-mqtt-client` are recorded here. Format follows [Kee
 
 ## [Unreleased]
 
+### Changed
+
+- What paho keeps from a dropped link is no longer replayed by paho after `on_connect`, uncapped ([#21](https://github.com/electrification-bus/ebus-mqtt-client/issues/21)). These are the QoS 1 and 2 messages paho accepted on the live link and had not finished delivering, and any QoS 1 or 2 publish it refused between the drop and `on_disconnect`. paho's replay sent them after anything `on_connect_callback` published, so an older retained value overwrote the republished one, and in one burst that ignores `max_inflight_messages`, so at QoS 2 mosquitto discarded what exceeded its receive quota. On a connect without a session, `publish()`'s hold now takes them back from paho, in front of what it holds, under its existing rules (newest retained value per topic wins, QoS 1 and 2 events in order, non-retained QoS 0 dropped), and flushes them before `on_connect_callback` on a live link, where paho's inflight cap applies. What paho kept from before `stop()` is dropped. A message taken back has its `MQTTMessageInfo.rc` set to `MQTT_ERR_NO_CONN`, as a held publish has, and that info never completes. Each connect that takes messages back logs `reason=mqttLeftoversReclaimed` with the count and `disposition=held` or `dropped`. The wrapper uses paho's public `Client.drop_out_messages()` where present and otherwise paho's private `_out_messages` and `_out_message_mutex`; without either, paho's replay is left alone. On a connect with a session present, paho resumes its queue as before.
+- The `paho-mqtt` requirement is capped below 3 (`paho-mqtt>=1.5.0,<3`), since the fallback above relies on paho internals.
+
+### Added
+
+- `tests/test_broker.py`: real-mosquitto tests through a TCP proxy that withholds acks and cuts the link. They fail on 0.7.1: a leftover overwriting the `on_connect` republish (QoS 1 and 2, acks withheld or nothing delivered), QoS 2 leftover bursts past the broker quota (40 against the default 20, 250 against 200), a 250-topic tree republish over 250 leftovers, a leftover resurrected after an asyncio-driver stop and restart, and a canary that paho still hands its leftovers to `on_connect` and replays nothing after.
+
 ## [0.7.1] - 2026-10-08
 
 ### Fixed

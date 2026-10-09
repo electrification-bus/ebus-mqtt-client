@@ -6,6 +6,9 @@ mosquitto (``max_inflight_messages``, default 20) acknowledges what exceeds its
 receive quota from an MQTT 3.1.1 client and discards it, so retained state ended
 on whichever value survived. A fake paho cannot show that, so these run a broker.
 
+The same holds for what paho keeps from a dropped link (GH #21). Those tests
+put a TCP proxy between client and broker to withhold acks and cut the link.
+
 The mTLS tests (deferred since 0.1.5 for want of a broker fixture) run real
 handshakes against a broker that requires client certificates, which the mocked
 ``load_cert_chain`` tests in ``test_client.py`` cannot: certificate and key from
@@ -327,6 +330,305 @@ def test_with_retain_flag_marks_a_replay_caused_by_an_overlapping_subscription(b
         c.stop()
     assert flagged == [("t/ov/b", b"R", True), ("t/ov/b", b"R", True)]
     assert plain == []
+
+
+# --- What paho keeps from a dropped link (GH #21) ----------------------------
+#
+# paho keeps a QoS 1/2 publish it sent on a live link until the PUBACK or
+# PUBCOMP, and replays what is left after a drop from _handle_connack, after
+# on_connect, in one burst that ignores max_inflight_messages. A TCP proxy
+# between client and broker withholds the acks (or everything) on the live
+# connection and then cuts it; the client's reconnect gets a fresh connection.
+
+
+def _parse_publishes(buf: bytearray) -> list[tuple[str, int, str]]:
+    """Consume complete MQTT 3.1.1 packets from ``buf``; return the PUBLISHes
+    as (topic, qos, payload)."""
+    out = []
+    while len(buf) >= 2:
+        mult, rem, i = 1, 0, 1
+        while True:
+            if i >= len(buf):
+                return out
+            b = buf[i]
+            rem += (b & 0x7F) * mult
+            mult *= 128
+            i += 1
+            if not b & 0x80:
+                break
+        if len(buf) < i + rem:
+            return out
+        hdr, body = buf[0], bytes(buf[i : i + rem])
+        del buf[: i + rem]
+        if hdr >> 4 == 3:
+            qos = (hdr >> 1) & 3
+            tlen = int.from_bytes(body[:2], "big")
+            off = 2 + tlen + (2 if qos else 0)
+            out.append((body[2 : 2 + tlen].decode(), qos, body[off:].decode()))
+    return out
+
+
+class _ProxiedConnection:
+    def __init__(self, proxy, client_sock, upstream_sock, index):
+        self.proxy, self.c, self.u, self.index = proxy, client_sock, upstream_sock, index
+        self.stall_up = threading.Event()  # client -> broker
+        self.stall_down = threading.Event()  # broker -> client
+        self._parse_buf = bytearray()
+        for src, dst, stall, up in (
+            (self.c, self.u, self.stall_up, True),
+            (self.u, self.c, self.stall_down, False),
+        ):
+            threading.Thread(target=self._pump, args=(src, dst, stall, up), daemon=True).start()
+
+    def _pump(self, src, dst, stall, up):
+        try:
+            while data := src.recv(65536):
+                if stall.is_set():
+                    continue  # swallowed
+                if up:
+                    self._parse_buf += data
+                    for p in _parse_publishes(self._parse_buf):
+                        self.proxy.wire.append((self.index, *p))
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            self.close()
+
+    def close(self):
+        for s in (self.c, self.u):
+            with contextlib.suppress(OSError):
+                s.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                s.close()
+
+
+class _Proxy:
+    """TCP proxy on a free 127.0.0.1 port, recording each forwarded PUBLISH as
+    (connection index, topic, qos, payload)."""
+
+    def __init__(self, broker_port):
+        self.broker_port = broker_port
+        self.lsock = socket.socket()
+        self.lsock.bind(("127.0.0.1", 0))
+        self.lsock.listen(8)
+        self.port = self.lsock.getsockname()[1]
+        self.conns: list[_ProxiedConnection] = []
+        self.wire: list[tuple[int, str, int, str]] = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                c, _ = self.lsock.accept()
+            except OSError:
+                return
+            u = socket.create_connection(("127.0.0.1", self.broker_port))
+            self.conns.append(_ProxiedConnection(self, c, u, len(self.conns)))
+
+    def last_connection_wire(self) -> list[tuple[str, int, str]]:
+        n = len(self.conns) - 1
+        return [w[1:] for w in self.wire if w[0] == n]
+
+    def close(self):
+        with contextlib.suppress(OSError):
+            self.lsock.close()
+        for c in self.conns:
+            c.close()
+
+
+@contextlib.contextmanager
+def _proxied_broker(extra_conf: str = ""):
+    with _mosquitto(extra_conf) as port:
+        proxy = _Proxy(port)
+        try:
+            yield port, proxy
+        finally:
+            proxy.close()
+
+
+def _idle(c: MqttClient) -> bool:
+    return not c.mqttc._out_messages
+
+
+def _strand(proxy, publish, withhold):
+    """Run ``publish`` on the live connection with ``withhold`` stalled ("acks":
+    the PUBLISH reaches the broker, its ack does not come back; "all": nothing
+    is delivered either way), then cut the connection. Returns what ``publish``
+    returned."""
+    conn = proxy.conns[-1]
+    conn.stall_down.set()
+    if withhold == "all":
+        conn.stall_up.set()
+    before = len(proxy.wire)
+    result = publish()
+    if withhold == "acks":
+        assert _wait(lambda: len(proxy.wire) > before), "PUBLISH never reached the proxy"
+    time.sleep(0.2)
+    conn.close()
+    return result
+
+
+def _proxied_client(proxy, connects: list, republish=None) -> MqttClient:
+    def on_connect():
+        connects.append(1)
+        if republish:
+            republish()
+
+    c = _client(proxy.port, on_connect_callback=on_connect)
+    c.mqttc.reconnect_delay_set(min_delay=0.1, max_delay=0.1)  # the cut is deliberate
+    return c
+
+
+@pytest.mark.parametrize("withhold", ["acks", "all"])
+@pytest.mark.parametrize("qos", [1, 2])
+def test_a_value_left_in_paho_does_not_overwrite_the_on_connect_republish(qos, withhold):
+    with _proxied_broker() as (port, proxy):
+        latest = {"v": "old"}
+        connects: list = []
+        c = _proxied_client(
+            proxy, connects, lambda: c.publish("t/state", latest["v"], qos=qos, retain=True)
+        )
+        c.start()
+        try:
+            assert _wait(lambda: len(connects) == 1 and _idle(c))
+
+            def publish_old():
+                info = c.publish("t/state", "old", qos=qos, retain=True)
+                latest["v"] = "new"
+                return info
+
+            info = _strand(proxy, publish_old, withhold)
+            assert info.rc == mqtt.MQTT_ERR_SUCCESS and not info.is_published()
+            assert _wait(lambda: len(connects) == 2) and _wait(lambda: _idle(c))
+            got = _retained(port, "t/state", settle=0.5)
+            wire = proxy.last_connection_wire()
+        finally:
+            c.stop()
+    assert got == {"t/state": "new"}
+    assert [p for _, _, p in wire] == ["old", "new"]
+
+
+@pytest.mark.parametrize(
+    "broker_inflight,n", [(None, 40), (200, 250)], ids=["default-quota-40", "quota-200-250"]
+)
+def test_a_qos2_burst_left_in_paho_lands_completely(broker_inflight, n):
+    # Past the broker's receive quota. paho's replay sent it all at once and
+    # mosquitto discarded the excess; reclaimed, it goes out under the cap.
+    conf = f"max_inflight_messages {broker_inflight}\n" if broker_inflight else ""
+    with _proxied_broker(conf) as (port, proxy):
+        connects: list = []
+        c = _proxied_client(proxy, connects)
+        c.start()
+        try:
+            assert _wait(lambda: len(connects) == 1 and _idle(c))
+            infos = _strand(
+                proxy,
+                lambda: [c.publish(f"k/{i}", str(i), qos=2, retain=True) for i in range(n)],
+                "acks",
+            )
+            assert all(i.rc == mqtt.MQTT_ERR_SUCCESS for i in infos)
+            assert _wait(lambda: len(connects) == 2) and _wait(lambda: _idle(c), 15)
+            got = _retained(port, "k/#")
+        finally:
+            c.stop()
+    assert got == {f"k/{i}": str(i) for i in range(n)}
+
+
+def test_a_tree_republish_after_250_leftovers_ends_on_the_new_values():
+    # The ebus-sdk shape: the whole tree was in flight at the drop, and
+    # on_connect_callback republishes all of it with newer values.
+    n = 250
+    with _proxied_broker("max_inflight_messages 200\n") as (port, proxy):
+        gen = {"v": "old"}
+        connects: list = []
+
+        def republish():
+            for i in range(n):
+                c.publish(f"k/{i}", f"{gen['v']}{i}", qos=2, retain=True)
+
+        c = _proxied_client(proxy, connects, republish)
+        c.start()
+        try:
+            assert _wait(lambda: len(connects) == 1 and _idle(c))
+
+            def publish_mid():
+                infos = [c.publish(f"k/{i}", f"mid{i}", qos=2, retain=True) for i in range(n)]
+                gen["v"] = "new"
+                return infos
+
+            _strand(proxy, publish_mid, "acks")
+            assert _wait(lambda: len(connects) == 2) and _wait(lambda: _idle(c), 15)
+            got = _retained(port, "k/#")
+        finally:
+            c.stop()
+    assert got == {f"k/{i}": f"new{i}" for i in range(n)}
+
+
+def test_paho_still_hands_its_leftovers_to_on_connect_and_replays_nothing_after():
+    # Canary for the paho ordering the fix relies on: at on_connect the
+    # leftovers are still in paho's queue, and once taken, paho's replay after
+    # on_connect has nothing left to send.
+    with _proxied_broker() as (port, proxy):
+        connects: list = []
+        c = _proxied_client(proxy, connects, lambda: c.publish("t/marker", "m", qos=1))
+        taken: list[int] = []
+        take = c._take_paho_leftovers
+
+        def recording_take():
+            msgs = take()
+            taken.append(len(msgs))
+            return msgs
+
+        c._take_paho_leftovers = recording_take
+        c.start()
+        try:
+            assert _wait(lambda: len(connects) == 1 and _idle(c))
+            _strand(proxy, lambda: c.publish("t/state", "old", qos=1, retain=True), "all")
+            assert _wait(lambda: len(connects) == 2) and _wait(lambda: _idle(c))
+            time.sleep(0.2)
+            wire = proxy.last_connection_wire()
+        finally:
+            c.stop()
+    assert taken == [0, 1]
+    assert [t for t, _, _ in wire] == ["t/state", "t/marker"]
+
+
+def test_a_value_left_in_paho_at_an_asyncio_driver_stop_is_not_resurrected():
+    # The stop drops what paho kept; the restarted connection must not replay
+    # it on top of what its on_connect_callback republishes.
+    import asyncio
+
+    async def run(proxy):
+        connects: list = []
+        c = _proxied_client(proxy, connects)
+        driver = c.asyncio_driver()
+        await driver.start()
+        assert await _await(lambda: len(connects) == 1 and _idle(c))
+        conn = proxy.conns[-1]
+        conn.stall_up.set()
+        conn.stall_down.set()
+        c.publish("s/state", "old", qos=1, retain=True)
+        await asyncio.sleep(0.2)
+        await driver.stop()
+        conn.close()
+        c.on_connect_callback = lambda: (
+            connects.append(2),
+            c.publish("s/state", "new", qos=1, retain=True),
+        )
+        restarted = c.asyncio_driver()
+        await restarted.start()
+        assert await _await(lambda: len(connects) == 2 and _idle(c))
+        await asyncio.sleep(0.2)
+        wire = proxy.last_connection_wire()
+        await restarted.stop()
+        return wire
+
+    with _proxied_broker() as (port, proxy):
+        wire = asyncio.run(run(proxy))
+        got = _retained(port, "s/state", settle=0.5)
+    assert [p for _, _, p in wire] == ["new"]
+    assert got == {"s/state": "new"}
 
 
 OPENSSL = shutil.which("openssl")

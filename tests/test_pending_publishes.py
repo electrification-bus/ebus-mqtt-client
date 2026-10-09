@@ -41,12 +41,18 @@ class FakePaho:
     The wrapper never hands paho a publish while the link is not ready, but one
     racing a link drop still lands in that queue; `refuse_sends` models that
     window. A fake that discarded at every QoS would hide it.
+
+    `unacked` models a live link whose acks never arrive: a QoS 1 or 2 publish
+    goes on the wire and also stays in `_out_messages`, as paho keeps it until
+    the PUBACK or PUBCOMP, so it is still there when the link drops (GH #21).
     """
 
     def __init__(self):
         self.connected = False
         self.published: list[tuple[str, str, int, bool]] = []  # in wire order
         self._out_messages: OrderedDict[int, SimpleNamespace] = OrderedDict()
+        self._out_message_mutex = threading.Lock()
+        self.unacked = False
         self._mid = 0
         # Report connected but refuse to send: the window after paho has noticed
         # the drop (socket closed) and before on_disconnect reaches the wrapper.
@@ -96,13 +102,18 @@ class FakePaho:
         if not self.connected or self.refuse_sends:
             info.rc = mqtt.MQTT_ERR_NO_CONN
             if qos > 0:
-                self._out_messages[self._mid] = SimpleNamespace(
-                    topic=topic, payload=data, qos=qos, retain=retain
-                )
+                self._store(topic, data, qos, retain, info)
             return info
         self.published.append((topic, data, qos, retain))
         info.rc = mqtt.MQTT_ERR_SUCCESS
+        if self.unacked and qos > 0:
+            self._store(topic, data, qos, retain, info)
         return info
+
+    def _store(self, topic, data, qos, retain, info):
+        self._out_messages[self._mid] = SimpleNamespace(
+            topic=topic, payload=data, qos=qos, retain=retain, info=info
+        )
 
     def drain_queue(self):
         """What `_handle_connack` does once `on_connect` has returned."""
@@ -603,10 +614,10 @@ class TestValidationMatchesPaho:
 
 
 class TestPahosOwnQueue:
-    def test_a_qos12_publish_refused_in_the_drop_window_is_left_to_paho(self, client):
+    def test_a_qos12_publish_refused_in_the_drop_window_is_reclaimed_on_connect(self, client):
         # Between the link dropping and on_disconnect, paho refuses a publish
-        # but stores it at QoS 1 and 2 and resends it itself; holding it too
-        # would send it twice.
+        # but stores it at QoS 1 and 2. The wrapper does not hold it as well,
+        # which would send it twice; it takes it back on the next connect.
         connect(client)
         client._fake.refuse_sends = True
         info = client.publish("a/state", "v", qos=1, retain=True)
@@ -623,3 +634,146 @@ class TestPahosOwnQueue:
         client._fake.refuse_sends = True
         client.publish("a/state", "v", qos=0, retain=True)
         assert "a/state" in client._pending
+
+
+def drop_link(client):
+    client._fake.connected = False
+    client._on_disconnect(client._fake, None, 1)
+
+
+def leave_in_paho(client, *publishes):
+    """Publish on a live link whose acks never arrive, so each QoS 1/2 message
+    is still in paho's out-queue when the link drops. Returns the infos."""
+    client._fake.unacked = True
+    infos = [client.publish(*p) for p in publishes]
+    client._fake.unacked = False
+    return infos
+
+
+class TestPahosLeftoversAreReclaimed:
+    """What paho kept from a dropped link is taken back on the next connect and
+    flushed with the hold, ahead of on_connect_callback, rather than replayed
+    by paho after it (GH #21)."""
+
+    def test_reclaimed_ahead_of_the_hold_and_a_newer_held_value_wins(self, client):
+        connect(client)
+        leave_in_paho(client, ("a/state", "old", 1, True), ("b/state", "b-old", 2, True))
+        drop_link(client)
+        client.publish("a/state", "new", qos=1, retain=True)
+        mark = len(client._fake.published)
+        connect(client)
+        assert client._fake.published[mark:] == [
+            ("b/state", "b-old", 2, True),
+            ("a/state", "new", 1, True),
+        ]
+        assert not client._fake._out_messages
+
+    def test_leftover_events_precede_held_ones(self, client):
+        connect(client)
+        leave_in_paho(client, ("e/x", "e1", 1, False), ("e/x", "e2", 1, False))
+        drop_link(client)
+        client.publish("e/x", "e3", qos=1)
+        mark = len(client._fake.published)
+        connect(client)
+        assert payloads(client)[mark:] == ["e1", "e2", "e3"]
+
+    def test_reclaimed_values_land_before_the_connect_callback(self, client):
+        connect(client)
+        leave_in_paho(client, ("a/state", "old", 1, True))
+        drop_link(client)
+        client.on_connect_callback = lambda: client.publish("a/state", "fresh", qos=1, retain=True)
+        mark = len(client._fake.published)
+        connect(client)
+        assert payloads(client)[mark:] == ["old", "fresh"]
+
+    def test_a_qos0_event_is_dropped_and_a_qos0_retained_value_held(self, client):
+        connect(client)
+        fake = client._fake
+        for topic, retain in (("e/x", False), ("a/state", True)):
+            fake._mid += 1
+            fake._store(topic, "v", 0, retain, mqtt.MQTTMessageInfo(fake._mid))
+        drop_link(client)
+        mark = len(fake.published)
+        connect(client)
+        assert fake.published[mark:] == [("a/state", "v", 0, True)]
+
+    def test_a_reclaimed_info_reports_no_conn(self, client):
+        connect(client)
+        (info,) = leave_in_paho(client, ("a/state", "old", 1, True))
+        assert info.rc == mqtt.MQTT_ERR_SUCCESS
+        drop_link(client)
+        connect(client)
+        assert info.rc == mqtt.MQTT_ERR_NO_CONN
+
+    def test_reclaiming_is_logged(self, client, caplog):
+        connect(client)
+        leave_in_paho(client, ("a/state", "old", 1, True), ("b/state", "old", 1, True))
+        drop_link(client)
+        with caplog.at_level(logging.INFO):
+            connect(client)
+        lines = [r.message for r in caplog.records if "mqttLeftoversReclaimed" in r.message]
+        assert lines == ["reason=mqttLeftoversReclaimed,client=test,count=2,disposition=held"]
+
+    def test_with_a_session_present_paho_keeps_its_queue(self, client):
+        connect(client)
+        leave_in_paho(client, ("a/state", "old", 1, True))
+        drop_link(client)
+        client.on_connect_callback = lambda: client.publish("a/state", "fresh", qos=1, retain=True)
+        client._fake.connected = True
+        client._on_connect(client._fake, None, {"session present": 1}, 0)
+        assert client._fake.queued == [("a/state", "old", 1, True)]
+
+    def test_leftovers_from_before_stop_are_dropped(self, client, caplog):
+        connect(client)
+        leave_in_paho(client, ("a/state", "old", 1, True))
+        client.stop(timeout=0.1)
+        client.start()
+        mark = len(client._fake.published)
+        with caplog.at_level(logging.INFO):
+            connect(client)
+        assert client._fake.published[mark:] == []
+        assert "count=1,disposition=dropped" in caplog.text
+
+    def test_leftovers_after_a_restart_are_reclaimed_again(self, client):
+        connect(client)
+        client.stop(timeout=0.1)
+        client.start()
+        connect(client)
+        leave_in_paho(client, ("a/state", "old", 1, True))
+        drop_link(client)
+        mark = len(client._fake.published)
+        connect(client)
+        assert payloads(client)[mark:] == ["old"]
+
+    def test_pahos_public_drop_out_messages_is_preferred(self, client):
+        fake = client._fake
+        calls = []
+
+        def drop_out_messages():
+            calls.append(1)
+            msgs = list(fake._out_messages.values())
+            fake._out_messages.clear()
+            return msgs
+
+        fake.drop_out_messages = drop_out_messages
+        del fake._out_message_mutex
+        connect(client)
+        leave_in_paho(client, ("a/state", "old", 1, True))
+        drop_link(client)
+        mark = len(fake.published)
+        connect(client)
+        assert calls and payloads(client)[mark:] == ["old"]
+
+    @pytest.mark.parametrize("layout", ["no-mutex", "not-a-dict"])
+    def test_without_pahos_layout_its_queue_is_left_alone(self, client, layout):
+        fake = client._fake
+        connect(client)
+        leave_in_paho(client, ("a/state", "old", 1, True))
+        drop_link(client)
+        if layout == "no-mutex":
+            del fake._out_message_mutex
+        else:
+            fake._out_messages = list(fake._out_messages.values())
+        fake.connected = True
+        client._on_connect(fake, None, {"session present": 0}, 0)
+        assert len(fake._out_messages) == 1
