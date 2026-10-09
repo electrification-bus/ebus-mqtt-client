@@ -19,7 +19,7 @@ jobs:
         # 3.10/3.11/3.13 were unverified despite being declared supported.
         python-version: ["3.10", "3.11", "3.12", "3.13"]
         # "latest" is whatever .[dev] resolves (the current paho 2.x); "1.x" is
-        # the paho-mqtt>=1.5.0 floor the package still declares support for. The
+        # the paho-mqtt>=1.6.0 floor the package still declares support for. The
         # wrapper targets paho's VERSION1 callback API, which both majors
         # provide, but only the un-mocked tests/test_real_paho.py smoke tests and
         # the broker-backed tests/test_broker.py actually cross that boundary
@@ -46,5 +46,5 @@ jobs:
       # suite actually runs against the older major.
       - name: Pin paho-mqtt to the 1.x major
         if: matrix.paho == '1.x'
-        run: pip install 'paho-mqtt>=1.5,<2'
+        run: pip install 'paho-mqtt>=1.6,<2'
       - run: python -m pytest -q

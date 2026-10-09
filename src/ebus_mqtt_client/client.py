@@ -181,6 +181,9 @@ class MqttClient:
         self._pending_extra = 0
         # Set by stop(), cleared by start(): nothing is held while stopped.
         self._stopped = False
+        # Set by stop(), cleared by the next connect: what paho still holds from
+        # before the stop is dropped there rather than reclaimed (GH #21).
+        self._drop_leftovers = False
         # Whether publishes may go to paho: set when the flush on connect takes
         # the hold (under _pending_lock, so later publishes queue behind it),
         # cleared on disconnect. Distinct from paho's is_connected(), which turns
@@ -492,6 +495,7 @@ class MqttClient:
         with self._hold_lock:
             self._link_ready = False
             self._stopped = True
+            self._drop_leftovers = True
             self._pending.clear()
             self._pending_dropped = 0
             self._pending_extra = 0
@@ -545,9 +549,12 @@ class MqttClient:
         one. At QoS 2 the burst can also exceed the broker's receive quota
         (mosquitto's ``max_inflight_messages``, default 20); mosquitto
         acknowledges the excess from an MQTT 3.1.1 client and discards it
-        (GH #20). paho still replays what it accepted on a live link and had not
-        finished delivering when the link dropped, and a QoS 1 or 2 publish it
-        refuses in the moment between the drop and ``on_disconnect``.
+        (GH #20). For the same reason, what paho keeps from a dropped link (QoS
+        1 and 2 messages it accepted on the live link and had not finished
+        delivering, and any it refused between the drop and ``on_disconnect``)
+        is taken back on the next connect without a session and put in front
+        of the hold, under the rules above, so the flush sends it (GH #21).
+        What paho kept from before :meth:`stop` is dropped instead.
 
         Arguments paho would reject (a non-``str`` or wildcard topic, an empty
         topic under MQTT 3.1.1, a QoS outside 0-2, a payload paho cannot encode)
@@ -556,7 +563,8 @@ class MqttClient:
         result code. A held publish returns an ``MQTTMessageInfo`` with
         ``rc == MQTT_ERR_NO_CONN``, as paho reports a refused publish; the
         message is published afresh when the hold is flushed, so that info never
-        completes.
+        completes. A message paho kept from a dropped link and the wrapper takes
+        back has its info set the same way, and it never completes either.
         """
         if not hasattr(self, "mqttc"):
             logging.error(f"reason=mqttPublishNoClient,client={self.client_id},topic={topic}")
@@ -579,7 +587,8 @@ class MqttClient:
                     return self._hold_or_drop(topic, data, qos, retain)
         if msg_info.rc == mqtt.MQTT_ERR_NO_CONN:
             # The link dropped and paho noticed before on_disconnect told us. At
-            # QoS 1 and 2 paho has stored the message and will resend it itself.
+            # QoS 1 and 2 paho has stored the message; the next connect reclaims
+            # it into the hold (_reclaim_leftovers).
             logging.debug(
                 f"reason=mqttPublishNotConnected,client={self.client_id},"
                 f"topic={topic},qos={qos},disposition=queuedByPaho"
@@ -668,7 +677,64 @@ class MqttClient:
         for entry in newer.values():
             self._hold(*entry)
 
-    def _flush_pending(self) -> None:
+    def _take_paho_leftovers(self) -> list[Any]:
+        """Remove from paho, oldest first, the messages it would replay after
+        ``on_connect``. Caller holds _pending_lock, so no publish is inside paho.
+
+        Prefers paho's public ``drop_out_messages()`` (paho > 2.1.0). Otherwise
+        uses the private ``_out_messages`` and ``_out_message_mutex`` (the same
+        in 1.6.1 and 2.1.0); without them, paho's replay is left alone.
+        """
+        drop = getattr(self.mqttc, "drop_out_messages", None)
+        if callable(drop):
+            return list(drop())
+        out = getattr(self.mqttc, "_out_messages", None)
+        mutex = getattr(self.mqttc, "_out_message_mutex", None)
+        if not isinstance(out, dict) or mutex is None:
+            return []
+        with mutex:
+            msgs = list(out.values())
+            out.clear()
+        return msgs
+
+    def _reclaim_leftovers(self) -> None:
+        """Move paho's leftovers from the previous connection to the front of
+        the hold, so the flush sends them (GH #21). Caller holds _pending_lock.
+
+        Runs from ``on_connect`` on a connect with no session. paho's reconnect
+        reset has already returned every leftover to its unsent state and zeroed
+        its inflight count, and its replay after ``on_connect`` would send them
+        in one uncapped burst, after anything ``on_connect_callback`` published.
+        Taken here, they follow the hold's rules: a retained value yields to a
+        newer one held for its topic, a QoS 1 or 2 event keeps its place ahead
+        of newer events, and a QoS 0 event is dropped. Leftovers from before
+        :meth:`stop` are dropped. Each reclaimed message's info gets
+        ``rc == MQTT_ERR_NO_CONN`` and never completes, as for a held publish.
+        """
+        try:
+            msgs = self._take_paho_leftovers()
+            taken = []
+            for m in msgs:
+                m.info.rc = mqtt.MQTT_ERR_NO_CONN
+                if m.retain or m.qos > 0:
+                    taken.append((m.topic, m.payload, m.qos, bool(m.retain)))
+        except Exception:
+            # Raising here would end paho's network loop.
+            logging.warning(f"reason=mqttReclaimFailed,client={self.client_id}", exc_info=True)
+            return
+        with self._hold_lock:
+            stale, self._drop_leftovers = self._drop_leftovers, False
+            held = 0 if stale or self._stopped else len(taken)
+            if held:
+                self._prepend(taken)
+        for count, disposition in ((held, "held"), (len(msgs) - held, "dropped")):
+            if count:
+                logging.info(
+                    f"reason=mqttLeftoversReclaimed,client={self.client_id},"
+                    f"count={count},disposition={disposition}"
+                )
+
+    def _flush_pending(self, reclaim: bool = False) -> None:
         """Publish what was held while disconnected, oldest first, then mark the
         link ready so later publishes go straight to paho.
 
@@ -684,8 +750,16 @@ class MqttClient:
 
         If the link drops mid-flush, what was not sent goes back in front of the
         hold rather than being lost, so it survives to the next connect.
+
+        With ``reclaim``, what paho kept from the previous connection is sent
+        first; see :meth:`_reclaim_leftovers`.
         """
         with self._pending_lock:
+            if reclaim:
+                self._reclaim_leftovers()
+            else:
+                with self._hold_lock:
+                    self._drop_leftovers = False
             with self._hold_lock:
                 if self._stopped:
                     return
@@ -713,7 +787,8 @@ class MqttClient:
                 if info is None or (info.rc == mqtt.MQTT_ERR_NO_CONN and qos == 0):
                     unsent.append(entry)
                 elif info.rc not in (mqtt.MQTT_ERR_SUCCESS, mqtt.MQTT_ERR_NO_CONN):
-                    # NO_CONN at QoS 1 or 2: paho stored it and resends it itself.
+                    # NO_CONN at QoS 1 or 2: paho stored it; the next connect
+                    # reclaims it.
                     failed += 1
                     logging.warning(
                         f"reason=mqttPublishFail,client={self.client_id},topic={topic},rc={info.rc}"
@@ -864,8 +939,15 @@ class MqttClient:
         # The callback's publishes reach paho after the flush, but a broker may
         # apply a QoS 2 message only at PUBREL (mosquitto does), so a retained
         # value the callback republishes wins over a flushed one only at the
-        # same or a higher QoS.
-        self._flush_pending()
+        # same or a higher QoS. Without a session, what paho kept from the last
+        # connection goes out in the flush too, rather than in paho's replay
+        # after this callback (GH #21); with one, paho resumes it as the session
+        # requires.
+        if isinstance(flags, dict):
+            session_present = bool(flags.get("session present"))
+        else:
+            session_present = bool(getattr(flags, "session_present", False))
+        self._flush_pending(reclaim=not session_present)
 
         # Re-subscribe on reconnect (iterate shallow copy in case dict changes)
         for sub, (_, qos) in list(self.sub_callbacks.items()):
